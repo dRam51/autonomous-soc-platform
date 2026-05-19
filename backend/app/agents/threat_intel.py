@@ -1,108 +1,140 @@
 """
-Threat Intel Agent — RAG-powered enrichment.
-Queries MITRE ATT&CK, CVE/NVD, and CISA KEV corpus to enrich the alert.
+Threat Intel Agent
+
+Techniques implemented:
+  - Prompt caching: system prompt cached to reduce cost
+  - Skills integration: calls virustotal, cisa_kev, nvd, rag_search dynamically
+  - Agentic skill loop: Claude decides which skills to call based on the alert context
+  - Structured tool use: submit_threat_intel guarantees typed output
 """
 
 from anthropic import AsyncAnthropic
 from app.config import settings
 from app.models.schemas import ThreatIntelResult
-from app.core.vector_store import query_threat_intel
+from app.skills import get_skill_schemas, dispatch_skill
 import logging
 
 logger = logging.getLogger(__name__)
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+THREAT_INTEL_SKILLS = ["lookup_virustotal", "check_cisa_kev", "get_cve_details", "rag_search"]
+
 THREAT_INTEL_SYSTEM_PROMPT = """You are a cyber threat intelligence analyst.
-Given a security alert and relevant threat intelligence context retrieved from our knowledge base,
-enrich the alert with:
-- Related CVEs and their CVSS scores
-- MITRE ATT&CK tactics and techniques
-- Known threat actors that use these TTPs
-- IOC analysis
-- An overall risk score (0.0-10.0)
 
-Base your analysis strictly on the provided context. If information is not available, say so."""
+Given a security alert and triage findings, enrich the alert with threat intelligence.
+You have access to these tools:
+  - lookup_virustotal: check IPs, domains, hashes against VirusTotal
+  - check_cisa_kev: verify if a CVE is actively exploited per CISA
+  - get_cve_details: fetch CVE details from NIST NVD
+  - rag_search: search the MITRE ATT&CK and threat intel knowledge base
 
-THREAT_INTEL_TOOLS = [
-    {
-        "name": "submit_threat_intel",
-        "description": "Submit the threat intelligence enrichment",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "related_cves": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of related CVE IDs",
-                },
-                "mitre_tactics": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "MITRE ATT&CK tactic names",
-                },
-                "threat_actors": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Known threat actor groups",
-                },
-                "ioc_analysis": {
-                    "type": "string",
-                    "description": "Analysis of the indicators of compromise",
-                },
-                "risk_score": {
-                    "type": "number",
-                    "description": "Overall risk score 0.0-10.0",
-                },
-            },
-            "required": ["ioc_analysis", "risk_score"],
+Use the tools proactively. For each IOC, check VirusTotal. For each CVE, check CISA KEV.
+For MITRE techniques from triage, search the knowledge base for context.
+
+Then submit your enrichment with:
+  - Related CVEs and exploitation status
+  - MITRE ATT&CK tactics
+  - Known threat actors
+  - IOC analysis summary
+  - Overall risk score (0.0-10.0)"""
+
+SUBMIT_THREAT_INTEL_TOOL = {
+    "name": "submit_threat_intel",
+    "description": "Submit the completed threat intelligence enrichment",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "related_cves": {"type": "array", "items": {"type": "string"}},
+            "mitre_tactics": {"type": "array", "items": {"type": "string"}},
+            "threat_actors": {"type": "array", "items": {"type": "string"}},
+            "ioc_analysis": {"type": "string"},
+            "risk_score": {"type": "number", "description": "0.0-10.0"},
         },
-    }
-]
+        "required": ["ioc_analysis", "risk_score"],
+    },
+}
 
 
 async def run_threat_intel(state: dict) -> dict:
+    """
+    Threat Intel agent with full agentic skill loop.
+    Claude autonomously decides which tools to call based on alert context.
+    """
     alert = state["alert"]
     alert_id = state["alert_id"]
     triage = state["triage"]
 
     logger.info(f"[ThreatIntel] Enriching alert {alert_id}")
 
-    # RAG: retrieve relevant threat intel from vector store
-    query = f"{alert.title} {alert.description} {' '.join(triage.mitre_techniques)}"
-    rag_context = await query_threat_intel(query, top_k=5)
+    tools = get_skill_schemas(THREAT_INTEL_SKILLS) + [SUBMIT_THREAT_INTEL_TOOL]
 
     prompt = f"""Enrich this security alert with threat intelligence.
 
 Alert: {alert.title}
 Description: {alert.description}
+Source IP: {alert.source_ip or 'Unknown'}
+Destination IP: {alert.destination_ip or 'Unknown'}
 IOCs: {', '.join(alert.iocs) if alert.iocs else 'None'}
-MITRE Techniques (from triage): {', '.join(triage.mitre_techniques)}
 
-Retrieved Threat Intelligence Context:
-{rag_context}
+Triage findings:
+  Severity: {triage.severity}
+  MITRE Techniques: {', '.join(triage.mitre_techniques) if triage.mitre_techniques else 'None identified'}
+  Reasoning: {triage.reasoning}
 
-Submit your enrichment using the submit_threat_intel tool."""
+Use the available tools to enrich this alert, then submit your threat intelligence findings."""
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1024,
-        system=THREAT_INTEL_SYSTEM_PROMPT,
-        tools=THREAT_INTEL_TOOLS,
-        tool_choice={"type": "any"},
-        messages=[{"role": "user", "content": prompt}],
-    )
+    messages = [{"role": "user", "content": prompt}]
+    max_iterations = 8  # Allow more iterations for comprehensive enrichment
 
-    tool_use = next(b for b in response.content if b.type == "tool_use")
-    result_data = tool_use.input
+    for _ in range(max_iterations):
+        response = await client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1536,
+            system=[
+                {
+                    "type": "text",
+                    "text": THREAT_INTEL_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},  # PROMPT CACHING
+                }
+            ],
+            tools=tools,
+            messages=messages,
+        )
 
-    threat_intel_result = ThreatIntelResult(
-        alert_id=alert_id,
-        related_cves=result_data.get("related_cves", []),
-        mitre_tactics=result_data.get("mitre_tactics", []),
-        threat_actors=result_data.get("threat_actors", []),
-        ioc_analysis=result_data["ioc_analysis"],
-        risk_score=result_data["risk_score"],
-    )
+        # Check for final submission
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "submit_threat_intel":
+                data = block.input
+                result = ThreatIntelResult(
+                    alert_id=alert_id,
+                    related_cves=data.get("related_cves", []),
+                    mitre_tactics=data.get("mitre_tactics", []),
+                    threat_actors=data.get("threat_actors", []),
+                    ioc_analysis=data["ioc_analysis"],
+                    risk_score=data["risk_score"],
+                )
+                logger.info(
+                    f"[ThreatIntel] Alert {alert_id} -> risk_score={result.risk_score}/10 "
+                    f"cves={result.related_cves} actors={result.threat_actors}"
+                )
+                return {**state, "threat_intel": result}
 
-    logger.info(f"[ThreatIntel] Alert {alert_id} → risk score: {threat_intel_result.risk_score}/10")
-    return {**state, "threat_intel": threat_intel_result}
+        # Execute skill calls with self-correction: if a skill fails, Claude gets the error
+        # and can try a different approach on the next iteration
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use" and block.name != "submit_threat_intel":
+                result_text = await dispatch_skill(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+
+        if not tool_results:
+            break
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    raise RuntimeError(f"[ThreatIntel] Agent did not submit findings for alert {alert_id}")

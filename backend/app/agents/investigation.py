@@ -1,81 +1,91 @@
 """
-Investigation Agent — Deep dive for medium/high/critical alerts.
-Reconstructs attack timeline, identifies lateral movement, and assesses blast radius.
+Investigation Agent
+
+Techniques implemented:
+  - Extended thinking: Claude reasons step-by-step before producing output
+  - Agentic self-correction: retries with alternate approaches on skill failure
+  - Skills integration: shodan, geolocate_ip, virustotal, rag_search
+  - Prompt caching: system prompt cached
+  - Agent memory: prior incident context injected from memory store
 """
 
 from anthropic import AsyncAnthropic
 from app.config import settings
 from app.models.schemas import InvestigationResult
+from app.skills import get_skill_schemas, dispatch_skill
+from app.core.memory import recall_memories, extract_entities_from_alert
 import logging
 
 logger = logging.getLogger(__name__)
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+INVESTIGATION_SKILLS = ["get_host_info", "geolocate_ip", "lookup_virustotal", "rag_search"]
+
 INVESTIGATION_SYSTEM_PROMPT = """You are a senior incident responder conducting a deep-dive investigation.
 
-Your job is to:
-1. Reconstruct the attack timeline based on all available data
-2. Identify the full attack chain (initial access → execution → persistence → exfiltration etc.)
-3. Determine affected assets and blast radius
-4. Assess lateral movement and data exfiltration risk
-5. Provide a comprehensive analysis
+You have access to:
+  - get_host_info: Shodan lookup for open ports, services, C2 tags
+  - geolocate_ip: Country, ASN, proxy/VPN/datacenter flags
+  - lookup_virustotal: IOC reputation and detection ratio
+  - rag_search: MITRE ATT&CK and threat intel knowledge base
 
-Think step-by-step. Be thorough but structured."""
+Investigation approach:
+1. Investigate all IPs and domains using available tools
+2. Search for attack pattern context in the knowledge base
+3. Reconstruct the attack timeline step by step
+4. Identify the full attack chain from initial access to current stage
+5. Determine blast radius: affected assets, lateral movement, exfiltration risk
+6. Write a comprehensive investigation narrative
 
-INVESTIGATION_TOOLS = [
-    {
-        "name": "submit_investigation",
-        "description": "Submit the investigation findings",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "timeline": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "timestamp": {"type": "string"},
-                            "event": {"type": "string"},
-                        },
+Think step by step. Be thorough. If a tool returns no data, try a different approach."""
+
+SUBMIT_INVESTIGATION_TOOL = {
+    "name": "submit_investigation",
+    "description": "Submit the completed investigation findings",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "timeline": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "timestamp": {"type": "string"},
+                        "event": {"type": "string"},
                     },
-                    "description": "Reconstructed attack timeline events",
-                },
-                "attack_chain": {
-                    "type": "string",
-                    "description": "Step-by-step attack chain description",
-                },
-                "affected_assets": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of affected or potentially affected assets",
-                },
-                "lateral_movement_detected": {
-                    "type": "boolean",
-                    "description": "Whether lateral movement was detected or is suspected",
-                },
-                "data_exfiltration_risk": {
-                    "type": "boolean",
-                    "description": "Whether data exfiltration is a risk",
-                },
-                "full_analysis": {
-                    "type": "string",
-                    "description": "Full investigation narrative",
                 },
             },
-            "required": ["attack_chain", "affected_assets", "lateral_movement_detected",
-                         "data_exfiltration_risk", "full_analysis"],
+            "attack_chain": {"type": "string"},
+            "affected_assets": {"type": "array", "items": {"type": "string"}},
+            "lateral_movement_detected": {"type": "boolean"},
+            "data_exfiltration_risk": {"type": "boolean"},
+            "full_analysis": {"type": "string"},
         },
-    }
-]
+        "required": [
+            "attack_chain", "affected_assets", "lateral_movement_detected",
+            "data_exfiltration_risk", "full_analysis",
+        ],
+    },
+}
 
 
 async def run_investigation(state: dict) -> dict:
+    """
+    Investigation agent with extended thinking, self-correcting skill loop,
+    and memory-augmented context.
+    """
     alert = state["alert"]
     alert_id = state["alert_id"]
     triage = state["triage"]
     threat_intel = state["threat_intel"]
 
     logger.info(f"[Investigation] Deep-diving alert {alert_id}")
+
+    # Recall prior incidents involving the same entities (agent memory)
+    entities = await extract_entities_from_alert(alert)
+    memory_context = await recall_memories(entities)
+
+    tools = get_skill_schemas(INVESTIGATION_SKILLS) + [SUBMIT_INVESTIGATION_TOOL]
 
     prompt = f"""Conduct a deep-dive investigation of this security incident.
 
@@ -85,6 +95,7 @@ Description: {alert.description}
 Source IP: {alert.source_ip or 'Unknown'}
 Destination IP: {alert.destination_ip or 'Unknown'}
 Affected Host: {alert.affected_host or 'Unknown'}
+IOCs: {', '.join(alert.iocs) if alert.iocs else 'None'}
 Raw Log: {alert.raw_log or 'Not provided'}
 
 === Triage Results ===
@@ -99,29 +110,85 @@ Threat Actors: {', '.join(threat_intel.threat_actors)}
 Risk Score: {threat_intel.risk_score}/10
 IOC Analysis: {threat_intel.ioc_analysis}
 
-Conduct a thorough investigation and submit your findings."""
+=== Agent Memory (Prior Incidents) ===
+{memory_context}
 
-    response = await client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=2048,
-        system=INVESTIGATION_SYSTEM_PROMPT,
-        tools=INVESTIGATION_TOOLS,
-        tool_choice={"type": "any"},
-        messages=[{"role": "user", "content": prompt}],
-    )
+Use the available tools to investigate all IPs, look up host intelligence, and search
+for attack pattern context. Then submit your complete investigation findings."""
 
-    tool_use = next(b for b in response.content if b.type == "tool_use")
-    result_data = tool_use.input
+    messages = [{"role": "user", "content": prompt}]
+    max_iterations = 10
 
-    investigation_result = InvestigationResult(
-        alert_id=alert_id,
-        timeline=result_data.get("timeline", []),
-        attack_chain=result_data["attack_chain"],
-        affected_assets=result_data["affected_assets"],
-        lateral_movement_detected=result_data["lateral_movement_detected"],
-        data_exfiltration_risk=result_data["data_exfiltration_risk"],
-        full_analysis=result_data["full_analysis"],
-    )
+    # Extended thinking parameters
+    thinking_params = {}
+    if settings.enable_extended_thinking:
+        thinking_params = {
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 8000,  # Allow up to 8k tokens of internal reasoning
+            }
+        }
 
-    logger.info(f"[Investigation] Alert {alert_id} → lateral_movement={investigation_result.lateral_movement_detected}")
-    return {**state, "investigation": investigation_result}
+    for iteration in range(max_iterations):
+        response = await client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=[
+                {
+                    "type": "text",
+                    "text": INVESTIGATION_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=tools,
+            messages=messages,
+            **thinking_params,
+        )
+
+        # Check for final submission
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "submit_investigation":
+                data = block.input
+                result = InvestigationResult(
+                    alert_id=alert_id,
+                    timeline=data.get("timeline", []),
+                    attack_chain=data["attack_chain"],
+                    affected_assets=data["affected_assets"],
+                    lateral_movement_detected=data["lateral_movement_detected"],
+                    data_exfiltration_risk=data["data_exfiltration_risk"],
+                    full_analysis=data["full_analysis"],
+                )
+                logger.info(
+                    f"[Investigation] Alert {alert_id} -> "
+                    f"lateral_movement={result.lateral_movement_detected} "
+                    f"exfil_risk={result.data_exfiltration_risk}"
+                )
+                return {**state, "investigation": result}
+
+        # Execute skill calls with self-correction:
+        # If a skill returns an error, Claude sees it and can try a different approach
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use" and block.name != "submit_investigation":
+                result_text = await dispatch_skill(block.name, block.input)
+
+                # Self-correction hint: if skill failed, prompt Claude to try differently
+                if "failed" in result_text.lower() or "not configured" in result_text.lower():
+                    result_text += (
+                        "\n[System note: This tool is unavailable. "
+                        "Try a different approach or tool to gather this information.]"
+                    )
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+
+        if not tool_results:
+            break
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    raise RuntimeError(f"[Investigation] Agent did not submit findings for alert {alert_id}")

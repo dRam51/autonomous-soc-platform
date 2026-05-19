@@ -409,7 +409,7 @@ Built with Next.js + Tailwind CSS + shadcn/ui. Key views:
 
 ## AI Techniques
 
-Beyond the core multi-agent pipeline, this project incorporates a range of AI techniques across prompting, agent design, ML, and production engineering. Each one is listed with what it does and where it fits in the system.
+Beyond the core multi-agent pipeline, this project incorporates a range of AI techniques across prompting, agent design, ML, and production engineering. Each one is listed with what it does, where it fits in the system, and which week it gets built.
 
 ---
 
@@ -420,30 +420,35 @@ Claude can reason step-by-step before producing output. The internal reasoning i
 
 - Where it fits: Investigation agent. Reconstructing an attack chain requires genuine sequential reasoning (initial access, lateral movement, exfiltration). Extended thinking lets Claude actually work through that chain rather than pattern-match to an answer.
 - Difficulty: Low. One parameter change in the API call.
+- Built: Week 3
 
 **Prompt Caching**
 Anthropic's API caches prompt prefixes. If the same system prompt and context appear at the start of many requests, you only pay to process it once. Subsequent requests with that cached prefix are significantly faster and cheaper.
 
 - Where it fits: Every agent has a long system prompt plus injected threat intel context. Caching the system prompt prefix drops agent call costs by roughly 90% on repeated invocations.
 - Difficulty: Low. Requires adding `cache_control` blocks to message construction.
+- Built: Week 2
 
 **Dynamic Few-Shot Prompting**
 Instead of static examples in a system prompt, retrieve the most relevant past examples from the database at runtime and inject them. "Here are 3 similar past alerts and how they were triaged, use these as reference."
 
 - Where it fits: Triage agent. Retrieving the 3 most similar past incidents by embedding similarity gives Claude a calibrated reference point. The system improves over time as it builds up a library of verified examples.
 - Difficulty: Medium. Requires storing triage outcomes in PostgreSQL and querying by similarity.
+- Built: Week 3
 
 **Self-Reflection and Self-Critique**
 After an agent produces its output, a second pass asks Claude to critique it: "Review your triage assessment. Is the severity correct? Did you miss any indicators? Would you change anything?" The agent can then revise before finalizing.
 
 - Where it fits: Triage and Investigation agents, where false negatives (missing a critical alert) are costly. The critique pass acts as a built-in QA step.
 - Difficulty: Low to medium. One additional API call per agent with a structured critique prompt.
+- Built: Week 3
 
 **Confidence Calibration**
 Agents output a confidence score, but calibration means that score should be statistically meaningful. If an agent says 0.9 confidence, it should be right 90% of the time. Measured and adjusted using LangSmith eval results over time.
 
 - Where it fits: Triage severity scoring. Calibrated scores enable routing rules such as "if confidence is below 0.6, require human review" rather than treating all scores equally.
 - Difficulty: Medium. Requires eval infrastructure and statistical measurement.
+- Built: Week 4
 
 ---
 
@@ -454,6 +459,7 @@ LangGraph's `interrupt()` mechanism pauses the graph at a specific node and wait
 
 - Where it fits: Before the Remediation agent executes on a CRITICAL severity alert. The graph pauses, an analyst is notified, they review and approve or modify the plan, then the pipeline continues. This is a real compliance requirement in production SOC environments.
 - Difficulty: Medium. LangGraph supports this natively; requires a notification mechanism and dashboard integration.
+- Built: Week 4
 
 **Parallel Agent Execution**
 LangGraph supports running multiple nodes simultaneously using `Send`. Agents that do not depend on each other's output can run in parallel, cutting total pipeline time.
@@ -471,6 +477,7 @@ Triage (must run first)
 ```
 
 - Difficulty: Medium. Requires restructuring the LangGraph graph with parallel branching.
+- Built: Week 3
 
 **Agent Memory**
 Agents remember past incidents and apply that knowledge to new ones. A persistent memory store that survives across sessions, keyed by entity (IP, hostname, user account).
@@ -478,18 +485,21 @@ Agents remember past incidents and apply that knowledge to new ones. A persisten
 - Where it fits: "The last 3 alerts from IP 203.0.113.42 were all confirmed malicious. Treat new alerts from that source with elevated suspicion." This is how experienced analysts actually work.
 - Implementation: Store a memory document per entity in PostgreSQL. Before each agent run, retrieve relevant memories and inject them as context.
 - Difficulty: Medium.
+- Built: Week 4
 
 **Multi-Agent Voting**
 For high-stakes decisions, run the Triage agent multiple times with slightly varied prompts and take the majority vote. Reduces single-point-of-failure on the most important classification.
 
 - Where it fits: Triage severity scoring. If 3 independent runs all return CRITICAL, confidence is high. If they split, flag for human review automatically.
 - Difficulty: Low to medium.
+- Built: Week 3
 
 **Agentic Loops with Self-Correction**
 If a skill call fails or returns insufficient data, the agent retries with a different approach rather than propagating the error. "VirusTotal returned no data for that hash, so let me try searching by the associated IP instead."
 
 - Where it fits: Investigation agent. Real investigations hit dead ends and require backtracking. An agent that adapts its strategy is far more useful than one that fails on the first obstacle.
 - Difficulty: Medium. Requires agent prompts that explicitly handle tool failure cases.
+- Built: Week 3
 
 ---
 
@@ -501,6 +511,7 @@ Before alerts reach the agent pipeline, cluster them using embedding similarity.
 - Where it fits: A pre-processing step before the supervisor. Saves cost, reduces noise, and prevents alert storms from overwhelming the system.
 - Uses the same Pinecone and embedding infrastructure already in the project.
 - Difficulty: Medium. DBSCAN or cosine similarity threshold on alert embeddings.
+- Built: Week 2
 
 **ML-Based Anomaly Detection as a Pre-Filter**
 A lightweight classical ML model (Isolation Forest or One-Class SVM) runs on raw log features before the LLM pipeline. It assigns an anomaly score. Only events above a threshold go to the full agent pipeline.
@@ -508,6 +519,7 @@ A lightweight classical ML model (Isolation Forest or One-Class SVM) runs on raw
 - Where it fits: Between log ingestion and the supervisor. Low-score events get auto-closed without burning LLM tokens. High-score events go to agents for reasoning.
 - Why it matters: Demonstrates that LLMs are not the right tool for every step. Hybrid ML + LLM systems are what real production SOC platforms use.
 - Difficulty: Medium. Scikit-learn for the anomaly model, feature extraction from log fields.
+- Built: Week 3
 
 **Fine-Tuning on Security Data**
 Fine-tune a smaller model on security incident data (CVE descriptions, MITRE technique explanations, incident reports, threat intel). A fine-tuned domain-specific model can outperform a general large model on targeted tasks at a fraction of the cost.
@@ -543,18 +555,21 @@ Instead of waiting for the entire pipeline to finish, stream each agent's output
 
 - Where it fits: FastAPI with Server-Sent Events (SSE) or WebSockets, paired with LangGraph state streaming and real-time updates in Next.js.
 - Difficulty: Medium.
+- Built: Week 4
 
 **Batch Processing (Anthropic Batch API)**
 For non-urgent workloads (overnight threat hunts over historical alerts, bulk CVE enrichment, retroactive analysis), Anthropic's Batch API processes requests asynchronously at significantly lower cost than real-time API calls.
 
 - Where it fits: Scheduled threat hunting jobs and bulk RAG corpus updates.
 - Difficulty: Low.
+- Built: Week 4
 
 **Semantic Alert Deduplication**
 Before storing a new alert, embed it and check cosine similarity against recent alerts. If a semantically identical alert already exists within the last N minutes, increment a counter instead of creating a duplicate pipeline run.
 
 - Where it fits: The ingestion layer, before FastAPI hands off to Celery. Prevents alert storms from triggering hundreds of identical pipelines.
 - Difficulty: Low to medium.
+- Built: Week 2
 
 ---
 

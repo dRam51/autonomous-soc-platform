@@ -20,6 +20,12 @@ When a security alert fires, the platform does what a 5-person SOC team would do
   - [Layer 7: Data Persistence (PostgreSQL)](#layer-7-data-persistence-postgresql)
   - [Layer 8: Observability (LangSmith)](#layer-8-observability-langsmith)
   - [Layer 9: Dashboard (Next.js)](#layer-9-dashboard-nextjs)
+- [AI Techniques](#ai-techniques)
+  - [Prompting and Inference](#prompting-and-inference)
+  - [Agent Architecture Patterns](#agent-architecture-patterns)
+  - [Traditional ML + LLM Fusion](#traditional-ml--llm-fusion)
+  - [Data and Knowledge](#data-and-knowledge)
+  - [Production and Scale](#production-and-scale)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
@@ -401,6 +407,197 @@ Built with Next.js + Tailwind CSS + shadcn/ui. Key views:
 
 ---
 
+## AI Techniques
+
+Beyond the core multi-agent pipeline, this project incorporates a range of AI techniques across prompting, agent design, ML, and production engineering. Each one is listed with what it does, where it fits in the system, and which week it gets built.
+
+---
+
+### Prompting and Inference
+
+**Extended Thinking**
+Claude can reason step-by-step before producing output. The internal reasoning is hidden from the final response but dramatically improves accuracy on complex, multi-step problems.
+
+- Where it fits: Investigation agent. Reconstructing an attack chain requires genuine sequential reasoning (initial access, lateral movement, exfiltration). Extended thinking lets Claude actually work through that chain rather than pattern-match to an answer.
+- Difficulty: Low. One parameter change in the API call.
+- Built: Week 3
+
+**Prompt Caching**
+Anthropic's API caches prompt prefixes. If the same system prompt and context appear at the start of many requests, you only pay to process it once. Subsequent requests with that cached prefix are significantly faster and cheaper.
+
+- Where it fits: Every agent has a long system prompt plus injected threat intel context. Caching the system prompt prefix drops agent call costs by roughly 90% on repeated invocations.
+- Difficulty: Low. Requires adding `cache_control` blocks to message construction.
+- Built: Week 2
+
+**Dynamic Few-Shot Prompting**
+Instead of static examples in a system prompt, retrieve the most relevant past examples from the database at runtime and inject them. "Here are 3 similar past alerts and how they were triaged, use these as reference."
+
+- Where it fits: Triage agent. Retrieving the 3 most similar past incidents by embedding similarity gives Claude a calibrated reference point. The system improves over time as it builds up a library of verified examples.
+- Difficulty: Medium. Requires storing triage outcomes in PostgreSQL and querying by similarity.
+- Built: Week 3
+
+**Self-Reflection and Self-Critique**
+After an agent produces its output, a second pass asks Claude to critique it: "Review your triage assessment. Is the severity correct? Did you miss any indicators? Would you change anything?" The agent can then revise before finalizing.
+
+- Where it fits: Triage and Investigation agents, where false negatives (missing a critical alert) are costly. The critique pass acts as a built-in QA step.
+- Difficulty: Low to medium. One additional API call per agent with a structured critique prompt.
+- Built: Week 3
+
+**Confidence Calibration**
+Agents output a confidence score, but calibration means that score should be statistically meaningful. If an agent says 0.9 confidence, it should be right 90% of the time. Measured and adjusted using LangSmith eval results over time.
+
+- Where it fits: Triage severity scoring. Calibrated scores enable routing rules such as "if confidence is below 0.6, require human review" rather than treating all scores equally.
+- Difficulty: Medium. Requires eval infrastructure and statistical measurement.
+- Built: Week 4
+
+---
+
+### Agent Architecture Patterns
+
+**Human-in-the-Loop**
+LangGraph's `interrupt()` mechanism pauses the graph at a specific node and waits for human input before continuing. The graph state is persisted to the database while paused.
+
+- Where it fits: Before the Remediation agent executes on a CRITICAL severity alert. The graph pauses, an analyst is notified, they review and approve or modify the plan, then the pipeline continues. This is a real compliance requirement in production SOC environments.
+- Difficulty: Medium. LangGraph supports this natively; requires a notification mechanism and dashboard integration.
+- Built: Week 4
+
+**Parallel Agent Execution**
+LangGraph supports running multiple nodes simultaneously using `Send`. Agents that do not depend on each other's output can run in parallel, cutting total pipeline time.
+
+```
+Triage (must run first)
+    |
+    +--- Threat Intel ---+
+    |                    |  (run in parallel)
+    +--- IP Geolocation  |
+              |          |
+              +----------+
+                   |
+              Investigation  (waits for both)
+```
+
+- Difficulty: Medium. Requires restructuring the LangGraph graph with parallel branching.
+- Built: Week 3
+
+**Agent Memory**
+Agents remember past incidents and apply that knowledge to new ones. A persistent memory store that survives across sessions, keyed by entity (IP, hostname, user account).
+
+- Where it fits: "The last 3 alerts from IP 203.0.113.42 were all confirmed malicious. Treat new alerts from that source with elevated suspicion." This is how experienced analysts actually work.
+- Implementation: Store a memory document per entity in PostgreSQL. Before each agent run, retrieve relevant memories and inject them as context.
+- Difficulty: Medium.
+- Built: Week 4
+
+**Multi-Agent Voting**
+For high-stakes decisions, run the Triage agent multiple times with slightly varied prompts and take the majority vote. Reduces single-point-of-failure on the most important classification.
+
+- Where it fits: Triage severity scoring. If 3 independent runs all return CRITICAL, confidence is high. If they split, flag for human review automatically.
+- Difficulty: Low to medium.
+- Built: Week 3
+
+**Agentic Loops with Self-Correction**
+If a skill call fails or returns insufficient data, the agent retries with a different approach rather than propagating the error. "VirusTotal returned no data for that hash, so let me try searching by the associated IP instead."
+
+- Where it fits: Investigation agent. Real investigations hit dead ends and require backtracking. An agent that adapts its strategy is far more useful than one that fails on the first obstacle.
+- Difficulty: Medium. Requires agent prompts that explicitly handle tool failure cases.
+- Built: Week 3
+
+---
+
+### Traditional ML + LLM Fusion
+
+**Alert Deduplication and Clustering**
+Before alerts reach the agent pipeline, cluster them using embedding similarity. Fifty alerts from the same brute force campaign become one clustered alert with a count, not fifty separate pipeline runs.
+
+- Where it fits: A pre-processing step before the supervisor. Saves cost, reduces noise, and prevents alert storms from overwhelming the system.
+- Uses the same Pinecone and embedding infrastructure already in the project.
+- Difficulty: Medium. DBSCAN or cosine similarity threshold on alert embeddings.
+- Built: Week 2
+
+**ML-Based Anomaly Detection as a Pre-Filter**
+A lightweight classical ML model (Isolation Forest or One-Class SVM) runs on raw log features before the LLM pipeline. It assigns an anomaly score. Only events above a threshold go to the full agent pipeline.
+
+- Where it fits: Between log ingestion and the supervisor. Low-score events get auto-closed without burning LLM tokens. High-score events go to agents for reasoning.
+- Why it matters: Demonstrates that LLMs are not the right tool for every step. Hybrid ML + LLM systems are what real production SOC platforms use.
+- Difficulty: Medium. Scikit-learn for the anomaly model, feature extraction from log fields.
+- Built: Week 3
+
+**Fine-Tuning on Security Data**
+Fine-tune a smaller model on security incident data (CVE descriptions, MITRE technique explanations, incident reports, threat intel). A fine-tuned domain-specific model can outperform a general large model on targeted tasks at a fraction of the cost.
+
+- Where it fits: Triage severity classification. A model that has seen thousands of labeled security alerts makes faster and cheaper severity decisions than Opus on every call.
+- Difficulty: High. Requires a labeled dataset, fine-tuning infrastructure, and evaluation.
+- Built: Post-MVP
+
+---
+
+### Data and Knowledge
+
+**Knowledge Graph (MITRE ATT&CK)**
+Model MITRE ATT&CK as a proper graph rather than chunks of text. Techniques connect to tactics, tactics connect to kill chain phases, techniques relate to mitigations and data sources. Use graph traversal to reason about attack paths.
+
+- Where it fits: Investigation agent. "T1059 connects to the Execution tactic, which typically follows Initial Access via T1566 (phishing). Let me check for phishing indicators in this alert too." Graph reasoning finds implicit connections that vector search alone misses.
+- Difficulty: High. Requires a graph database (Neo4j or NetworkX) and graph-aware querying.
+- Built: Post-MVP
+
+**Active Learning from Analyst Feedback**
+When an analyst reviews an incident report and disagrees with the severity or findings, capture that feedback and use disagreement examples to improve prompts or build a fine-tuning dataset over time.
+
+- Where it fits: Dashboard. A simple thumbs up/down per agent output, stored in PostgreSQL. After enough disagreements on the same agent, trigger a prompt review alert.
+- Difficulty: Low to medium for feedback capture; high for the full improvement loop.
+- Built: Post-MVP
+
+---
+
+### Production and Scale
+
+**Streaming Agent Output**
+Instead of waiting for the entire pipeline to finish, stream each agent's output to the dashboard as it completes. The analyst sees Triage results appear first, then Threat Intel, then Investigation, rather than waiting on a spinner for 30 seconds.
+
+- Where it fits: FastAPI with Server-Sent Events (SSE) or WebSockets, paired with LangGraph state streaming and real-time updates in Next.js.
+- Difficulty: Medium.
+- Built: Week 4
+
+**Batch Processing (Anthropic Batch API)**
+For non-urgent workloads (overnight threat hunts over historical alerts, bulk CVE enrichment, retroactive analysis), Anthropic's Batch API processes requests asynchronously at significantly lower cost than real-time API calls.
+
+- Where it fits: Scheduled threat hunting jobs and bulk RAG corpus updates.
+- Difficulty: Low.
+- Built: Week 4
+
+**Semantic Alert Deduplication**
+Before storing a new alert, embed it and check cosine similarity against recent alerts. If a semantically identical alert already exists within the last N minutes, increment a counter instead of creating a duplicate pipeline run.
+
+- Where it fits: The ingestion layer, before FastAPI hands off to Celery. Prevents alert storms from triggering hundreds of identical pipelines.
+- Difficulty: Low to medium.
+- Built: Week 2
+
+---
+
+### Technique Roadmap
+
+| Technique | Category | Difficulty | Week |
+|---|---|---|---|
+| Prompt caching | Prompting | Low | 2 |
+| Alert deduplication and clustering | ML + LLM | Medium | 2 |
+| Semantic alert deduplication | Production | Low-Med | 2 |
+| Dynamic few-shot prompting | Prompting | Medium | 3 |
+| Self-reflection and self-critique | Prompting | Low-Med | 3 |
+| Extended thinking | Prompting | Low | 3 |
+| Multi-agent voting | Agent patterns | Low-Med | 3 |
+| Parallel agent execution | Agent patterns | Medium | 3 |
+| Agentic loops with self-correction | Agent patterns | Medium | 3 |
+| ML anomaly detection pre-filter | ML + LLM | Medium | 3 |
+| Confidence calibration | Prompting | Medium | 4 |
+| Human-in-the-loop | Agent patterns | Medium | 4 |
+| Agent memory | Agent patterns | Medium | 4 |
+| Streaming output | Production | Medium | 4 |
+| Batch processing | Production | Low | 4 |
+| Fine-tuning | ML + LLM | High | Post-MVP |
+| Knowledge graph | Data + Knowledge | High | Post-MVP |
+| Active learning | Data + Knowledge | Med-High | Post-MVP |
+
+---
+
 ## Tech Stack
 
 | Layer | Technology | Purpose |
@@ -547,26 +744,62 @@ Sample alerts for testing are in `data/seeds/sample_alerts.json`.
 ## Roadmap
 
 - [ ] Week 1: Infrastructure setup + threat intel ingestion pipeline
-- [ ] Week 2: Triage + Threat Intel agents + Skills Library (VirusTotal, CISA KEV, NVD, RAG)
-- [ ] Week 3: Investigation + Remediation + Reporting agents + remaining skills (Shodan, IP geolocation)
-- [ ] Week 4: Next.js dashboard + LangSmith evals + Docker polish
+- [ ] Week 2: Triage + Threat Intel agents + Skills Library (VirusTotal, CISA KEV, NVD, RAG) + prompt caching + alert deduplication
+- [ ] Week 3: Investigation + Remediation + Reporting agents + remaining skills (Shodan, IP geolocation) + extended thinking + self-reflection + few-shot prompting + parallel execution + self-correction + ML anomaly pre-filter
+- [ ] Week 4: Next.js dashboard + streaming output + human-in-the-loop + agent memory + confidence calibration + batch processing + LangSmith evals + Docker polish
+- [ ] Post-MVP: Fine-tuning on security data + MITRE knowledge graph + active learning feedback loop
 
 ---
 
 ## Skills Demonstrated
 
+**Agent and Orchestration**
 | Skill | Where |
 |---|---|
 | Multi-agent orchestration | LangGraph supervisor + conditional routing |
-| Agentic tool use | Skills library called dynamically by agents at runtime |
-| RAG pipelines | LangChain + Pinecone + Voyage-3 embeddings |
+| Parallel agent execution | Threat Intel and IP geolocation run simultaneously |
+| Human-in-the-loop | LangGraph interrupt on CRITICAL alerts for analyst approval |
+| Agent memory | Cross-session entity memory in PostgreSQL |
+| Agentic self-correction | Agents retry with alternate strategies on skill failure |
+| Multi-agent voting | Triage ensemble for high-stakes severity decisions |
+
+**Prompting and Inference**
+| Skill | Where |
+|---|---|
+| Extended thinking | Investigation agent for deep attack chain reasoning |
+| Prompt caching | All agents cache system prompt prefixes |
+| Dynamic few-shot prompting | Triage agent retrieves similar past incidents at runtime |
+| Self-reflection | Triage and Investigation agents critique their own outputs |
+| Confidence calibration | Triage severity scores validated against LangSmith eval results |
 | Structured LLM output | Every agent uses forced tool calling for typed, parseable responses |
 | Model tiering | Opus / Sonnet / Haiku matched to task complexity |
+
+**Skills and Data**
+| Skill | Where |
+|---|---|
+| Agentic tool use | Skills library called dynamically by agents at runtime |
+| RAG pipelines | LangChain + Pinecone + Voyage-3 embeddings |
+| Semantic search | Vector similarity over MITRE ATT&CK, CVE, CISA KEV corpus |
+| Alert deduplication | DBSCAN clustering on alert embeddings before pipeline entry |
+| ML anomaly detection | Isolation Forest pre-filter before LLM pipeline |
+
+**Production Engineering**
+| Skill | Where |
+|---|---|
+| Streaming output | Server-Sent Events from FastAPI to Next.js dashboard |
+| Batch processing | Anthropic Batch API for non-urgent bulk workloads |
 | Async backend engineering | FastAPI + Celery + Redis |
 | LLM observability + evals | LangSmith tracing on every agent call and skill invocation |
 | Production containerization | Docker Compose with health checks |
 | CI/CD | GitHub Actions lint + test on every push |
-| Cyber domain expertise | MITRE ATT&CK, CVE/NVD, CISA KEV, VirusTotal, Shodan, real IOC patterns |
+
+**Cyber Domain**
+| Skill | Where |
+|---|---|
+| Threat intelligence | MITRE ATT&CK, CVE/NVD, CISA KEV, VirusTotal, Shodan |
+| IOC analysis | IP reputation, geolocation, port scanning, hash lookups |
+| Incident response | NIST IR-aligned triage, investigation, remediation, reporting |
+| SOC workflow | Alert lifecycle from ingestion to closed incident report |
 
 ---
 

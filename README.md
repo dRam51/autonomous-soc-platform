@@ -449,15 +449,6 @@ Sample alerts for testing are in `data/seeds/sample_alerts.json`.
 
 ---
 
-## Roadmap
-
-- [ ] Week 1: Infrastructure setup + threat intel ingestion pipeline
-- [ ] Week 2: Triage + Threat Intel agents (core RAG pipeline)
-- [ ] Week 3: Investigation + Remediation + Reporting agents
-- [ ] Week 4: Next.js dashboard + LangSmith evals + Docker polish
-
----
-
 ## Skills Demonstrated
 
 | Skill | Where |
@@ -473,5 +464,3 @@ Sample alerts for testing are in `data/seeds/sample_alerts.json`.
 | Cyber domain expertise | MITRE ATT&CK, CVE/NVD, CISA KEV, real IOC patterns |
 
 ---
-
-Built with [Claude](https://anthropic.com) + [LangGraph](https://langchain-ai.github.io/langgraph/)

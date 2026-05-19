@@ -1,8 +1,8 @@
 # Autonomous SOC Platform
 
-An AI-powered Security Operations Center that mirrors how a real SOC team works — multiple specialized agents collaborating to triage, investigate, and remediate security alerts automatically.
+An automated Security Operations Center that mirrors how a real SOC team works. Multiple specialized agents collaborating to triage, investigate, and remediate security alerts automatically.
 
-When a security alert fires, the platform does what a 5-person SOC team would do — except in seconds, with every decision fully auditable.
+When a security alert fires, the platform does what a 5-person SOC team would do except in seconds, with every decision fully auditable.
 
 ---
 

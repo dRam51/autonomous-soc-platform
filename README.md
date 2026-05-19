@@ -143,5 +143,3 @@ autonomous-soc-platform/
 - Production Docker deployment
 
 ---
-
-Built with [Claude](https://anthropic.com) + LangGraph

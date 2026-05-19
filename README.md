@@ -280,8 +280,6 @@ The project uses two storage systems for two different jobs:
 | **PostgreSQL** | Alerts, incident reports, agent output history | Structured, relational, queryable with SQL |
 | **Pinecone** | Threat intelligence embeddings | Optimized purely for vector similarity search |
 
-PostgreSQL uses the **pgvector** extension, which adds native vector search support. This means you could consolidate both into PostgreSQL later if you want to eliminate Pinecone as a dependency. We use the Docker image `pgvector/pgvector:pg16` which ships with the extension pre-installed.
-
 ---
 
 ### Layer 7: Observability (LangSmith)

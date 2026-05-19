@@ -1,0 +1,43 @@
+# ─── Web Framework ──────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# ─── LLM & Agents ───────────────────────────────────────
+anthropic==0.40.0
+langchain==0.3.9
+langchain-anthropic==0.3.0
+langchain-community==0.3.9
+langgraph==0.2.55
+langsmith==0.1.147
+
+# ─── Vector Store ────────────────────────────────────────
+pinecone-client==5.0.1
+langchain-pinecone==0.2.0
+
+# ─── Database ────────────────────────────────────────────
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+
+# ─── Task Queue ──────────────────────────────────────────
+celery==5.4.0
+redis==5.2.1
+
+# ─── Data & Parsing ──────────────────────────────────────
+pydantic==2.10.3
+pydantic-settings==2.6.1
+httpx==0.28.1
+beautifulsoup4==4.12.3
+stix2==3.0.1
+
+# ─── Security Data ───────────────────────────────────────
+nvdlib==0.7.6
+
+# ─── Dev & Testing ───────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+python-dotenv==1.0.1
+ruff==0.8.4

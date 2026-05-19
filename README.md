@@ -133,13 +133,6 @@ autonomous-soc-platform/
 └── docker-compose.yml
 ```
 
-## Roadmap
-
-- [ ] Week 1 — Core infrastructure + threat intel ingestion
-- [ ] Week 2 — Triage + Threat Intel agents
-- [ ] Week 3 — Investigation + Remediation + Reporting agents
-- [ ] Week 4 — Next.js dashboard + LangSmith evals + Docker polish
-
 ## Skills Demonstrated
 
 - Multi-agent orchestration with LangGraph

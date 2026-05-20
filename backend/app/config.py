@@ -12,13 +12,19 @@ to speed up iteration, then re-enable them before deploying to production.
 
 from pydantic_settings import BaseSettings
 from typing import List
+from pathlib import Path
+
+# Resolve .env relative to this file so it works regardless of where uvicorn is launched from.
+_ENV_FILE = Path(__file__).parent.parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     # === LLM ===
-    # Used as the Anthropic API key for all Claude model calls AND as the Voyage
-    # embedding key (Voyage is an Anthropic-affiliated service sharing the same key).
     anthropic_api_key: str
+
+    # === Embeddings ===
+    # Voyage AI is a separate service from Anthropic — get a key at voyageai.com.
+    voyage_api_key: str = ""
 
     # === Vector Store ===
     pinecone_api_key: str
@@ -77,8 +83,9 @@ class Settings(BaseSettings):
     backend_cors_origins: List[str] = ["http://localhost:3000"]
 
     class Config:
-        env_file = ".env"
+        env_file = _ENV_FILE
         case_sensitive = False
+        extra = "ignore"  # .env has Docker-only vars (POSTGRES_USER etc.) not needed here
 
 
 settings = Settings()

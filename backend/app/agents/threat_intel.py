@@ -17,8 +17,17 @@ import logging
 logger = logging.getLogger(__name__)
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+# All four skills are available to this agent. The model autonomously decides
+# which ones to call based on what the alert actually contains (IOCs, CVEs, etc.).
+# Giving the model the full toolkit and letting it self-select is more flexible
+# than hard-coding "always check VirusTotal for every IP."
 THREAT_INTEL_SKILLS = ["lookup_virustotal", "check_cisa_kev", "get_cve_details", "rag_search"]
 
+# === System Prompt ===
+
+# Prompt caching: this system prompt is large and used on every alert. Marking it
+# with cache_control means the server tokenizes it once and reuses the KV cache
+# for subsequent calls that carry the same prompt bytes, reducing latency and cost.
 THREAT_INTEL_SYSTEM_PROMPT = """You are a cyber threat intelligence analyst.
 
 Given a security alert and triage findings, enrich the alert with threat intelligence.
@@ -38,6 +47,9 @@ Then submit your enrichment with:
   - IOC analysis summary
   - Overall risk score (0.0-10.0)"""
 
+# Forcing a submit_threat_intel call ensures downstream agents always receive a
+# ThreatIntelResult-compatible dict rather than unstructured prose. Without it, the
+# model might just narrate its findings and the pipeline would have nothing to parse.
 SUBMIT_THREAT_INTEL_TOOL = {
     "name": "submit_threat_intel",
     "description": "Submit the completed threat intelligence enrichment",
@@ -55,10 +67,17 @@ SUBMIT_THREAT_INTEL_TOOL = {
 }
 
 
+# === Main Entry Point ===
+
 async def run_threat_intel(state: dict) -> dict:
     """
     Threat Intel agent with full agentic skill loop.
     Claude autonomously decides which tools to call based on alert context.
+
+    This is the core agentic tool use pattern: the model receives tools as a menu
+    and iterates until it has gathered enough intelligence to produce a final answer.
+    Each tool result is injected back into the conversation so the model can use
+    prior results to decide what to look up next (e.g., find a CVE then check KEV).
     """
     alert = state["alert"]
     alert_id = state["alert_id"]
@@ -68,6 +87,9 @@ async def run_threat_intel(state: dict) -> dict:
 
     tools = get_skill_schemas(THREAT_INTEL_SKILLS) + [SUBMIT_THREAT_INTEL_TOOL]
 
+    # Include triage findings in the prompt so the model knows what MITRE techniques
+    # were already identified and can look them up in the knowledge base without
+    # rediscovering them from scratch.
     prompt = f"""Enrich this security alert with threat intelligence.
 
 Alert: {alert.title}
@@ -84,7 +106,9 @@ Triage findings:
 Use the available tools to enrich this alert, then submit your threat intelligence findings."""
 
     messages = [{"role": "user", "content": prompt}]
-    max_iterations = 8  # Allow more iterations for comprehensive enrichment
+    # More iterations than triage because comprehensive enrichment may require many
+    # tool calls: one VT lookup per IOC, one KEV check per CVE, one rag_search per TTP.
+    max_iterations = 8
 
     for _ in range(max_iterations):
         response = await client.messages.create(
@@ -101,7 +125,7 @@ Use the available tools to enrich this alert, then submit your threat intelligen
             messages=messages,
         )
 
-        # Check for final submission
+        # If the model called submit_threat_intel, parse and return the result.
         for block in response.content:
             if block.type == "tool_use" and block.name == "submit_threat_intel":
                 data = block.input
@@ -119,8 +143,9 @@ Use the available tools to enrich this alert, then submit your threat intelligen
                 )
                 return {**state, "threat_intel": result}
 
-        # Execute skill calls with self-correction: if a skill fails, Claude gets the error
-        # and can try a different approach on the next iteration
+        # Self-correction: execute skill calls and inject results back.
+        # If a skill fails (API down, key missing), the error string goes into context
+        # so the model knows to try a different approach or skip that enrichment step.
         tool_results = []
         for block in response.content:
             if block.type == "tool_use" and block.name != "submit_threat_intel":

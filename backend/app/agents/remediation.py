@@ -4,7 +4,8 @@ Remediation Agent
 Techniques implemented:
   - Prompt caching: system prompt cached
   - Skills integration: nvd and cisa_kev for live patch and exploitation data
-  - Structured tool use: forced submit_remediation call
+  - Structured tool use: forced submit_remediation call guarantees typed output
+  - Agentic tool use: model decides which CVEs need lookup before generating the plan
 """
 
 from anthropic import AsyncAnthropic
@@ -16,8 +17,16 @@ import logging
 logger = logging.getLogger(__name__)
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+# Remediation only needs CVE-focused skills. It does not need host intelligence
+# or IOC reputation because those were already handled by investigation. Limiting
+# the skill set keeps the model focused and reduces token overhead.
 REMEDIATION_SKILLS = ["get_cve_details", "check_cisa_kev"]
 
+# === System Prompt ===
+
+# Prompt caching: stable large prompt cached to save cost across repeated invocations.
+# Remediation gets called once per alert, but the same system prompt is used every
+# time, so caching still provides meaningful savings at scale.
 REMEDIATION_SYSTEM_PROMPT = """You are a cybersecurity remediation specialist.
 
 You have access to:
@@ -34,6 +43,10 @@ Generate a structured remediation plan with:
 
 Be specific, actionable, and prioritized based on actual exploitation data."""
 
+# The three-tier action structure (immediate, short-term, long-term) mirrors the
+# NIST IR lifecycle: Containment -> Eradication -> Recovery -> Post-Incident.
+# Using a typed tool output means the frontend can render each tier separately
+# without parsing prose.
 SUBMIT_REMEDIATION_TOOL = {
     "name": "submit_remediation",
     "description": "Submit the completed remediation plan",
@@ -51,17 +64,23 @@ SUBMIT_REMEDIATION_TOOL = {
 }
 
 
+# === Main Entry Point ===
+
 async def run_remediation(state: dict) -> dict:
     alert = state["alert"]
     alert_id = state["alert_id"]
     triage = state["triage"]
     threat_intel = state["threat_intel"]
+    # Investigation is optional: low/info severity alerts skip it entirely per supervisor routing.
     investigation = state.get("investigation")
 
     logger.info(f"[Remediation] Generating playbook for alert {alert_id}")
 
     tools = get_skill_schemas(REMEDIATION_SKILLS) + [SUBMIT_REMEDIATION_TOOL]
 
+    # Only include investigation context if it exists. The model handles both cases
+    # via the optional block; this avoids sending "None" strings into the prompt
+    # which can confuse the model about what data is actually available.
     investigation_context = ""
     if investigation:
         investigation_context = f"""
@@ -72,6 +91,9 @@ Lateral Movement: {investigation.lateral_movement_detected}
 Exfiltration Risk: {investigation.data_exfiltration_risk}
 """
 
+    # The prompt explicitly asks the model to look up CVE details before writing
+    # the plan. This grounds remediation advice in actual patch availability and
+    # active exploitation status rather than generic "patch your systems" guidance.
     prompt = f"""Generate a remediation plan for this security incident.
 
 === Incident Summary ===
@@ -87,6 +109,8 @@ Use get_cve_details and check_cisa_kev to look up patch availability and exploit
 status for the CVEs above, then submit a prioritized remediation plan."""
 
     messages = [{"role": "user", "content": prompt}]
+    # 6 iterations is enough: typically one NVD lookup and one KEV check per CVE,
+    # then submit. A 10-CVE incident would still fit within this budget.
     max_iterations = 6
 
     for _ in range(max_iterations):
@@ -104,6 +128,7 @@ status for the CVEs above, then submit a prioritized remediation plan."""
             messages=messages,
         )
 
+        # Check for final submission first.
         for block in response.content:
             if block.type == "tool_use" and block.name == "submit_remediation":
                 data = block.input
@@ -121,6 +146,8 @@ status for the CVEs above, then submit a prioritized remediation plan."""
                 )
                 return {**state, "remediation": result}
 
+        # Execute any skill calls. Errors in NVD or CISA KEV are tolerated: the model
+        # can still generate a plan based on what it knows, just without live patch data.
         tool_results = []
         for block in response.content:
             if block.type == "tool_use" and block.name != "submit_remediation":

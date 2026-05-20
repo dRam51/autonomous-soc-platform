@@ -30,6 +30,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# === Shared State ===
+
+# SOCState is the "working memory" of the entire pipeline. LangGraph passes this
+# dict through every node and each node returns an updated copy. Using TypedDict
+# instead of a plain dict gives us type safety and makes it clear what data each
+# agent can read or write.
 class SOCState(TypedDict):
     alert_id: str
     alert: AlertCreate
@@ -44,7 +50,7 @@ class SOCState(TypedDict):
     error: Optional[str]
 
 
-# ─── Parallel enrichment node ─────────────────────────────────────────────────
+# === Parallel Enrichment Node ===
 
 async def run_parallel_enrichment(state: SOCState) -> SOCState:
     """
@@ -55,6 +61,9 @@ async def run_parallel_enrichment(state: SOCState) -> SOCState:
       Instead of: triage -> threat_intel -> ip_geolocate (sequential)
       We get:     triage -> [threat_intel || ip_geolocate] -> investigation (parallel)
     """
+    # Parallel execution with asyncio.gather is the async equivalent of dispatching
+    # two analysts simultaneously. Neither task blocks the other. Wall-clock time
+    # is determined by the slower of the two, not the sum of both.
     alert = state["alert"]
 
     # Build parallel tasks
@@ -66,6 +75,8 @@ async def run_parallel_enrichment(state: SOCState) -> SOCState:
         ip_task = geolocate_ip(ip_to_check)
 
     if ip_task:
+        # return_exceptions=True prevents one failure from cancelling the other task.
+        # Without it, a VirusTotal timeout would kill the IP lookup too.
         threat_intel_result, ip_result = await asyncio.gather(
             threat_intel_task,
             ip_task,
@@ -76,12 +87,13 @@ async def run_parallel_enrichment(state: SOCState) -> SOCState:
         threat_intel_result = await threat_intel_task
         ip_context = "No IP addresses to geolocate"
 
-    # Merge results back into state
+    # Merge results back into state. The spread operator creates a new dict so
+    # LangGraph can diff the old and new state to compute what changed.
     new_state = threat_intel_result if isinstance(threat_intel_result, dict) else state
     return {**new_state, "ip_context": ip_context}
 
 
-# ─── Human-in-the-loop node ───────────────────────────────────────────────────
+# === Human-in-the-Loop Node ===
 
 async def hitl_approval_gate(state: SOCState) -> SOCState:
     """
@@ -99,6 +111,11 @@ async def hitl_approval_gate(state: SOCState) -> SOCState:
 
     is_critical = triage.severity.value == "critical"
 
+    # HITL pattern: the pipeline raises NodeInterrupt, which signals LangGraph to
+    # freeze execution and serialize the current SOCState to the checkpointer.
+    # This is analogous to a runbook step that says "escalate to Tier 2 before
+    # executing containment." The graph resumes from this exact node when
+    # resume_pipeline() sends an update with hitl_approved=True.
     if is_critical and settings.enable_hitl and not state.get("hitl_approved"):
         logger.info(
             f"[Supervisor] CRITICAL alert {state['alert_id']} paused for human approval"
@@ -113,7 +130,7 @@ async def hitl_approval_gate(state: SOCState) -> SOCState:
     return {**state, "hitl_approved": True}
 
 
-# ─── Routing logic ────────────────────────────────────────────────────────────
+# === Routing Logic ===
 
 def should_investigate(state: SOCState) -> str:
     """
@@ -121,13 +138,17 @@ def should_investigate(state: SOCState) -> str:
     Low and info alerts skip investigation and go straight to remediation.
     This saves cost and time proportional to actual risk.
     """
+    # This is a cost-optimized routing decision. Deep investigation (with extended
+    # thinking + many tool calls) is expensive. Running it on every low/info alert
+    # would be like paging your senior IR team for a port scan. Conditional edges
+    # in LangGraph work like routing keys: the return value selects which edge to follow.
     triage = state.get("triage")
     if triage and triage.severity.value in ("critical", "high", "medium"):
         return "investigate"
     return "remediate"
 
 
-# ─── Graph construction ───────────────────────────────────────────────────────
+# === Graph Construction ===
 
 def build_soc_graph() -> StateGraph:
     """
@@ -135,36 +156,48 @@ def build_soc_graph() -> StateGraph:
 
     Flow:
       triage -> parallel_enrichment -> hitl_gate -> [investigate | remediate] -> reporting
+
+    LangGraph compiles this into an executable graph where each node is an async
+    function and edges define execution order. The checkpointer enables HITL by
+    persisting state between invocations, keyed by thread_id (= alert_id).
     """
-    # Use MemorySaver for HITL state persistence (swap for SqliteSaver in production)
+    # MemorySaver stores state in a Python dict. Fine for development and demo.
+    # In production, swap for SqliteSaver or PostgresSaver so state survives restarts.
     checkpointer = MemorySaver()
 
     graph = StateGraph(SOCState)
 
-    graph.add_node("triage", run_triage)
+    # Node names must not clash with SOCState key names (LangGraph constraint).
+    # "triage", "investigation", and "remediation" are state keys, so we suffix with _node.
+    graph.add_node("triage_node", run_triage)
     graph.add_node("parallel_enrichment", run_parallel_enrichment)
     graph.add_node("hitl_gate", hitl_approval_gate)
-    graph.add_node("investigation", run_investigation)
-    graph.add_node("remediation", run_remediation)
+    graph.add_node("investigation_node", run_investigation)
+    graph.add_node("remediation_node", run_remediation)
     graph.add_node("reporting", run_reporting)
 
-    graph.set_entry_point("triage")
-    graph.add_edge("triage", "parallel_enrichment")
+    graph.set_entry_point("triage_node")
+    graph.add_edge("triage_node", "parallel_enrichment")
     graph.add_edge("parallel_enrichment", "hitl_gate")
     graph.add_conditional_edges(
         "hitl_gate",
         should_investigate,
-        {"investigate": "investigation", "remediate": "remediation"},
+        {"investigate": "investigation_node", "remediate": "remediation_node"},
     )
-    graph.add_edge("investigation", "remediation")
-    graph.add_edge("remediation", "reporting")
+    graph.add_edge("investigation_node", "remediation_node")
+    graph.add_edge("remediation_node", "reporting")
     graph.add_edge("reporting", END)
 
-    return graph.compile(checkpointer=checkpointer, interrupt_before=["hitl_gate"])
+    # interrupt_before must NOT list hitl_gate — the node itself raises NodeInterrupt
+    # conditionally for CRITICAL alerts. Listing it here pauses every pipeline unconditionally.
+    return graph.compile(checkpointer=checkpointer)
 
 
+# Module-level singleton so the graph is compiled once at startup, not per-request.
 soc_graph = build_soc_graph()
 
+
+# === Pipeline Entry Points ===
 
 async def process_alert(alert_id: str, alert: AlertCreate, anomaly_score: float = 1.0) -> IncidentReport:
     """Entry point: run the full multi-agent SOC pipeline for a given alert."""
@@ -179,11 +212,14 @@ async def process_alert(alert_id: str, alert: AlertCreate, anomaly_score: float 
         "investigation": None,
         "remediation": None,
         "incident_report": None,
-        "hitl_approved": not settings.enable_hitl,  # Auto-approve when HITL disabled
+        # When HITL is disabled, pre-approve so hitl_gate passes through immediately.
+        "hitl_approved": not settings.enable_hitl,
         "anomaly_score": anomaly_score,
         "error": None,
     }
 
+    # thread_id ties this run to its checkpoint in the MemorySaver.
+    # Using alert_id ensures each alert has its own isolated state slot.
     config = {"configurable": {"thread_id": alert_id}}
     final_state = await soc_graph.ainvoke(initial_state, config=config)
 
@@ -201,7 +237,8 @@ async def resume_pipeline(alert_id: str) -> IncidentReport:
     logger.info(f"[Supervisor] Resuming HITL-paused pipeline for alert {alert_id}")
     config = {"configurable": {"thread_id": alert_id}}
 
-    # Update state with approval and resume
+    # Injecting hitl_approved=True into the existing checkpoint state tells
+    # the graph to continue from the hitl_gate node without raising another interrupt.
     update = {"hitl_approved": True}
     final_state = await soc_graph.ainvoke(update, config=config)
 

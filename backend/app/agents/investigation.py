@@ -19,8 +19,15 @@ import logging
 logger = logging.getLogger(__name__)
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
+# Investigation needs the deepest skill set: host intelligence (Shodan), IP context,
+# IOC reputation (VirusTotal), and knowledge base search for attack pattern context.
 INVESTIGATION_SKILLS = ["get_host_info", "geolocate_ip", "lookup_virustotal", "rag_search"]
 
+# === System Prompt ===
+
+# Prompt caching: the system prompt here is extensive and stable. Caching it means
+# the first investigation call pays the tokenization cost; all subsequent calls
+# with the same prompt bytes reuse the cached KV state at lower cost and latency.
 INVESTIGATION_SYSTEM_PROMPT = """You are a senior incident responder conducting a deep-dive investigation.
 
 You have access to:
@@ -39,6 +46,9 @@ Investigation approach:
 
 Think step by step. Be thorough. If a tool returns no data, try a different approach."""
 
+# The submit_investigation tool enforces structure on what would otherwise be a
+# multi-page prose investigation narrative. Downstream agents (remediation, reporting)
+# need machine-readable fields, not a free-form write-up.
 SUBMIT_INVESTIGATION_TOOL = {
     "name": "submit_investigation",
     "description": "Submit the completed investigation findings",
@@ -69,10 +79,17 @@ SUBMIT_INVESTIGATION_TOOL = {
 }
 
 
+# === Main Entry Point ===
+
 async def run_investigation(state: dict) -> dict:
     """
     Investigation agent with extended thinking, self-correcting skill loop,
     and memory-augmented context.
+
+    This is the most expensive and most thorough agent in the pipeline. It runs
+    only for medium+ severity alerts (controlled by supervisor routing) and has
+    the longest iteration budget because reconstruction of an attack chain requires
+    exploring multiple data sources before conclusions can be drawn.
     """
     alert = state["alert"]
     alert_id = state["alert_id"]
@@ -81,12 +98,19 @@ async def run_investigation(state: dict) -> dict:
 
     logger.info(f"[Investigation] Deep-diving alert {alert_id}")
 
-    # Recall prior incidents involving the same entities (agent memory)
+    # === Agent Memory ===
+    # Before analyzing this alert, retrieve what we know about the entities involved
+    # from prior incidents. If 203.0.113.42 was a C2 server in a campaign last week,
+    # that context should inform this investigation even though it arrived in a
+    # different alert. This is the "cross-session memory" pattern.
     entities = await extract_entities_from_alert(alert)
     memory_context = await recall_memories(entities)
 
     tools = get_skill_schemas(INVESTIGATION_SKILLS) + [SUBMIT_INVESTIGATION_TOOL]
 
+    # The prompt bundles all prior agent outputs so the investigator has full context.
+    # This is a key design principle: each agent in the pipeline inherits the work
+    # of all prior agents rather than starting from scratch.
     prompt = f"""Conduct a deep-dive investigation of this security incident.
 
 === Alert ===
@@ -117,9 +141,17 @@ Use the available tools to investigate all IPs, look up host intelligence, and s
 for attack pattern context. Then submit your complete investigation findings."""
 
     messages = [{"role": "user", "content": prompt}]
+    # Longer iteration budget than threat_intel: building a timeline may require
+    # looking up every IP, then cross-referencing each in the knowledge base.
     max_iterations = 10
 
-    # Extended thinking parameters
+    # === Extended Thinking ===
+    # Extended thinking gives the model a private "scratchpad" of reasoning tokens
+    # before it produces its response. For complex attack chain reconstruction,
+    # this matters because the model needs to correlate multiple tool results,
+    # consider alternative hypotheses, and build a coherent timeline. Without
+    # extended thinking it might jump to the first plausible conclusion.
+    # budget_tokens caps the scratchpad size to control cost and latency.
     thinking_params = {}
     if settings.enable_extended_thinking:
         thinking_params = {
@@ -142,10 +174,11 @@ for attack pattern context. Then submit your complete investigation findings."""
             ],
             tools=tools,
             messages=messages,
+            # Spread thinking_params in: if empty dict, no thinking params are sent.
             **thinking_params,
         )
 
-        # Check for final submission
+        # Check for the final submission first before processing any tool calls.
         for block in response.content:
             if block.type == "tool_use" and block.name == "submit_investigation":
                 data = block.input
@@ -165,14 +198,18 @@ for attack pattern context. Then submit your complete investigation findings."""
                 )
                 return {**state, "investigation": result}
 
-        # Execute skill calls with self-correction:
-        # If a skill returns an error, Claude sees it and can try a different approach
+        # === Agentic Self-Correction ===
+        # Execute skill calls and inject results. If a skill returns an error, we
+        # append a system note telling the model to try a different approach. This
+        # prevents the model from getting stuck in a loop retrying a tool that is
+        # down. It can adapt: "Shodan is unavailable, use rag_search instead."
         tool_results = []
         for block in response.content:
             if block.type == "tool_use" and block.name != "submit_investigation":
                 result_text = await dispatch_skill(block.name, block.input)
 
-                # Self-correction hint: if skill failed, prompt Claude to try differently
+                # Self-correction hint: if the skill failed, steer the model away from
+                # retrying and toward an alternative data source.
                 if "failed" in result_text.lower() or "not configured" in result_text.lower():
                     result_text += (
                         "\n[System note: This tool is unavailable. "

@@ -10,6 +10,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# The schema description directly maps to what a SOC analyst would want to know
+# about a suspicious IP: is it a known C2, what services is it running, has Shodan
+# flagged it as a scanner? Detailed descriptions guide the model to use this skill
+# for infrastructure investigation rather than IOC reputation checks (that's VT).
 SHODAN_SCHEMA = {
     "name": "get_host_info",
     "description": (
@@ -32,7 +36,13 @@ SHODAN_BASE = "https://api.shodan.io"
 
 
 async def get_host_info(ip: str) -> str:
-    """Query Shodan for host intelligence on an IP address."""
+    """Query Shodan for host intelligence on an IP address.
+
+    Shodan's data differs from VirusTotal: instead of asking "is this IP malicious?",
+    Shodan tells you "what is running on this IP right now?" An attacker's C2 server
+    might be unknown to VT but clearly identifiable by Shodan's open-port data and
+    tags (e.g., tagged "c2" by Shodan's honeypot correlation engine).
+    """
     if not settings.shodan_api_key:
         return "Shodan API key not configured. Skipping host intelligence lookup."
 
@@ -55,8 +65,13 @@ async def get_host_info(ip: str) -> str:
     org = data.get("org", "Unknown")
     hostnames = data.get("hostnames", [])
     tags = data.get("tags", [])
+    # Shodan's vuln field contains CVEs detected from banner fingerprinting.
+    # These are not confirmed exploitations but known vulnerabilities on visible services.
     vulns = list(data.get("vulns", {}).keys())
 
+    # Limit to 5 services to keep the result concise enough for the model's context.
+    # The investigation agent needs to process results from multiple IPs, so verbosity here
+    # would dilute the signal.
     services = []
     for item in data.get("data", [])[:5]:
         port = item.get("port", "")
@@ -68,6 +83,9 @@ async def get_host_info(ip: str) -> str:
             svc += f" ({product} {version})".rstrip()
         services.append(svc)
 
+    # Shodan tags like "c2", "malware", "scanner", "tor" come from Shodan's own
+    # threat intelligence correlation. These are high-signal indicators that the
+    # model should treat as strong evidence in its investigation.
     threat_level = "HIGH" if any(t in tags for t in ["c2", "malware", "scanner", "tor"]) else "UNKNOWN"
 
     return (

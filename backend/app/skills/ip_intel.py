@@ -10,6 +10,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# The schema description emphasizes proxy/VPN/Tor flags because those are the
+# highest-signal contextual indicators for an investigation. A C2 connection from
+# a datacenter IP is more suspicious than one from a residential ISP because it
+# suggests deliberate infrastructure, not a compromised home machine.
 IP_INTEL_SCHEMA = {
     "name": "geolocate_ip",
     "description": (
@@ -29,16 +33,26 @@ IP_INTEL_SCHEMA = {
 }
 
 IP_API_BASE = "http://ip-api.com/json"
+# Request only the fields we use. ip-api charges per field in some plans and
+# unused fields add noise to the response that the model has to filter out.
 FIELDS = "status,message,country,countryCode,region,city,isp,org,as,proxy,hosting,query"
 
-# Known high-risk countries for context (not definitive, just informational)
+# High-risk country codes used as a contextual flag. These represent nations with
+# known state-sponsored threat actor programs. This is NOT a blocklist: an IP
+# from Russia is not automatically malicious, but it is additional context that
+# the investigation agent should consider alongside other indicators.
 HIGH_RISK_COUNTRY_CODES = {
     "CN", "RU", "KP", "IR", "BY", "SY"
 }
 
 
 async def geolocate_ip(ip: str) -> str:
-    """Geolocate an IP and return a formatted intelligence summary."""
+    """Geolocate an IP and return a formatted intelligence summary.
+
+    This skill runs in parallel with threat_intel in the supervisor (via asyncio.gather),
+    so its latency does not add to total pipeline time. ip-api.com responds in
+    well under 1 second for most IPs, making it ideal for parallel enrichment.
+    """
     url = f"{IP_API_BASE}/{ip}"
     params = {"fields": FIELDS}
 
@@ -62,6 +76,9 @@ async def geolocate_ip(ip: str) -> str:
     is_proxy = data.get("proxy", False)
     is_hosting = data.get("hosting", False)
 
+    # Build a list of risk flags so the model can quickly see what is notable.
+    # Multiple flags compound: a proxy in a high-risk country from a datacenter is
+    # a much stronger signal than any single flag alone.
     risk_flags = []
     if is_proxy:
         risk_flags.append("proxy/VPN")
@@ -70,6 +87,9 @@ async def geolocate_ip(ip: str) -> str:
     if country_code in HIGH_RISK_COUNTRY_CODES:
         risk_flags.append(f"high-risk country ({country_code})")
 
+    # Risk level thresholds: 2+ flags = HIGH, 1 flag = MEDIUM, 0 = LOW.
+    # This heuristic gives the model a quick signal without requiring it to reason
+    # about each flag independently in every alert.
     risk_level = "HIGH" if len(risk_flags) >= 2 else "MEDIUM" if risk_flags else "LOW"
 
     return (

@@ -2,6 +2,9 @@ version: "3.9"
 
 services:
   # ─── Backend API ────────────────────────────────────────
+  # FastAPI application: handles HTTP requests, runs the LangGraph pipeline
+  # as background tasks, and serves SSE streams to the frontend.
+  # --reload flag enables hot-reloading during development (remove in production).
   backend:
     build:
       context: ./backend
@@ -11,14 +14,17 @@ services:
     env_file: .env
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_healthy   # Wait for pg_isready before starting
       redis:
-        condition: service_healthy
+        condition: service_healthy   # Wait for redis ping before starting
     volumes:
-      - ./backend:/app
+      - ./backend:/app   # Mount source so --reload picks up code changes
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   # ─── Celery Worker (Agent Task Queue) ───────────────────
+  # Separate process that consumes tasks from the Redis broker.
+  # Handles batch API jobs and scheduled work that should not block the API.
+  # Shares the same image and env as backend so it can import app modules.
   worker:
     build:
       context: ./backend
@@ -32,6 +38,8 @@ services:
     command: celery -A app.tasks.celery_app worker --loglevel=info
 
   # ─── Frontend ───────────────────────────────────────────
+  # Next.js application serving the SOC dashboard UI.
+  # Depends on backend so it does not start before the API is available.
   frontend:
     build:
       context: ./frontend
@@ -43,6 +51,11 @@ services:
       - backend
 
   # ─── PostgreSQL ─────────────────────────────────────────
+  # pgvector/pgvector:pg16 is a PostgreSQL 16 image with the pgvector extension
+  # pre-installed. pgvector adds vector similarity search to PostgreSQL so that
+  # when the in-memory stores are replaced with DB persistence, you can also
+  # store and query alert embeddings directly in PostgreSQL without a separate
+  # vector database for that use case.
   db:
     image: pgvector/pgvector:pg16
     environment:
@@ -52,7 +65,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data   # Persist data across container restarts
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -60,8 +73,11 @@ services:
       retries: 5
 
   # ─── Redis ──────────────────────────────────────────────
+  # Redis serves dual roles: Celery broker (task queue) and Celery result backend
+  # (task status + return values). In a more complete production setup it would
+  # also serve as the SSE event queue and deduplication embedding cache.
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine   # Alpine variant is smaller; no persistence config needed for dev
     ports:
       - "6379:6379"
     healthcheck:
@@ -71,4 +87,6 @@ services:
       retries: 5
 
 volumes:
+  # Named volume so PostgreSQL data is retained when you docker-compose down
+  # and restart. Without this, the database is wiped on every restart.
   postgres_data:

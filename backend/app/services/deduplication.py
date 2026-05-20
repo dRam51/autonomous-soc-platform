@@ -26,12 +26,23 @@ logger = logging.getLogger(__name__)
 
 # In-memory store for recent alert embeddings. Swap for Redis in production.
 # Structure: list of {"alert_id": str, "embedding": list[float], "timestamp": datetime, "title": str}
+# Redis is better for production because it survives worker restarts and is shared
+# across multiple API server instances, whereas this in-memory store is per-process.
 _recent_embeddings: list[dict] = {}
 DEDUP_WINDOW_MINUTES = 30
 
 
+# === Cosine Similarity ===
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two embedding vectors."""
+    """Compute cosine similarity between two embedding vectors.
+
+    Cosine similarity measures the angle between two vectors, not their magnitude.
+    This is the right metric for embeddings because two semantically identical
+    sentences may have different vector magnitudes depending on length, but their
+    directions (angles) will be nearly identical. Range: -1 (opposite) to 1 (identical).
+    Practical threshold for "same alert": ~0.92+.
+    """
     va = np.array(a)
     vb = np.array(b)
     denom = np.linalg.norm(va) * np.linalg.norm(vb)
@@ -40,10 +51,18 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(va, vb) / denom)
 
 
+# === Embedding ===
+
 async def embed_alert(alert_text: str) -> list[float] | None:
     """
     Generate an embedding for alert text using Voyage-3.
     Returns None if embedding fails so deduplication degrades gracefully.
+
+    Voyage-3 is Anthropic's semantic embedding model. It maps text to a 1024-
+    dimensional vector where semantically similar texts cluster together. The
+    embedding captures meaning rather than exact phrasing, so "blocked outbound
+    connection to known C2" and "outbound traffic to C2 infrastructure blocked"
+    will have very high cosine similarity even though the words differ.
     """
     try:
         from langchain_community.embeddings import VoyageEmbeddings
@@ -55,12 +74,21 @@ async def embed_alert(alert_text: str) -> list[float] | None:
         return embedder.embed_query(alert_text)
     except Exception as e:
         logger.warning(f"[Dedup] Embedding failed: {e}")
+        # Return None rather than raising: if the embedding service is down,
+        # we pass all alerts through rather than blocking the pipeline entirely.
         return None
 
+
+# === Duplicate Check ===
 
 async def check_duplicate(alert_id: str, alert_title: str, alert_description: str) -> tuple[bool, str | None]:
     """
     Check if an incoming alert is semantically duplicate of a recent one.
+
+    Semantic deduplication works differently from exact deduplication (hash matching):
+    it catches rephrased, reformatted, or slightly varied versions of the same event.
+    A SIEM might generate "Brute force from 1.2.3.4" and "Multiple failed logins
+    from 1.2.3.4" for the same attack. Exact matching misses this; cosine similarity catches it.
 
     Returns:
         (is_duplicate, original_alert_id)
@@ -76,6 +104,9 @@ async def check_duplicate(alert_id: str, alert_title: str, alert_description: st
         return False, None
 
     cutoff = datetime.utcnow() - timedelta(minutes=DEDUP_WINDOW_MINUTES)
+    # Only compare against recent alerts. An alert from 2 hours ago that looks
+    # identical is probably a recurring event, not a duplicate - it should spawn
+    # its own pipeline for fresh analysis.
     recent = [e for e in _recent_embeddings if e["timestamp"] > cutoff]
 
     for candidate in recent:
@@ -87,22 +118,35 @@ async def check_duplicate(alert_id: str, alert_title: str, alert_description: st
             )
             return True, candidate["alert_id"]
 
-    # Not a duplicate - store embedding for future checks
+    # Not a duplicate: store this embedding for future checks.
     _recent_embeddings.append({
         "alert_id": alert_id,
         "embedding": embedding,
         "timestamp": datetime.utcnow(),
         "title": alert_title,
     })
-    # Keep only recent entries
+    # Evict expired entries to prevent unbounded memory growth.
     _recent_embeddings[:] = [e for e in _recent_embeddings if e["timestamp"] > cutoff]
 
     return False, None
 
 
+# === Alert Clustering ===
+
 def cluster_alerts(alert_embeddings: list[dict]) -> list[list[str]]:
     """
     Cluster a list of alerts by semantic similarity using DBSCAN.
+
+    DBSCAN (Density-Based Spatial Clustering of Applications with Noise):
+    Unlike k-means, DBSCAN does not require you to specify the number of clusters
+    upfront. It discovers clusters of arbitrary shape wherever embeddings are dense.
+    Points that do not belong to any dense region are labeled as "noise" (label -1).
+    This is ideal for alert data because you do not know in advance how many attack
+    campaigns are active.
+
+    A cluster of 50 SSH brute-force alerts pointing at the same host is discovered
+    automatically and can be surfaced as one coordinated campaign rather than 50
+    independent incidents. The ops team gets one ticket instead of fifty.
 
     Args:
         alert_embeddings: list of {"alert_id": str, "embedding": list[float]}
@@ -112,16 +156,17 @@ def cluster_alerts(alert_embeddings: list[dict]) -> list[list[str]]:
         Noise points (DBSCAN label -1) are returned as singleton clusters.
 
     DBSCAN parameters:
-        eps=0.15 - maximum cosine distance within a cluster (lower = tighter)
-        min_samples=2 - minimum alerts to form a cluster
+        eps=0.15 - maximum cosine distance within a cluster (lower = tighter clusters)
+        min_samples=2 - minimum 2 alerts to form a cluster (singletons are noise)
     """
     if len(alert_embeddings) < 2:
         return [[a["alert_id"]] for a in alert_embeddings]
 
     embeddings = np.array([a["embedding"] for a in alert_embeddings])
-    embeddings = normalize(embeddings)  # L2 normalize for cosine distance
+    # L2 normalize before using cosine metric so DBSCAN's distance computation
+    # is equivalent to cosine distance. Normalized vectors: cosine_dist = 1 - cosine_sim.
+    embeddings = normalize(embeddings)
 
-    # DBSCAN with cosine metric (1 - cosine_similarity)
     db = DBSCAN(eps=0.15, min_samples=2, metric="cosine")
     labels = db.fit_predict(embeddings)
 
@@ -129,7 +174,8 @@ def cluster_alerts(alert_embeddings: list[dict]) -> list[list[str]]:
     for i, label in enumerate(labels):
         clusters.setdefault(label, []).append(alert_embeddings[i]["alert_id"])
 
-    # Return noise (-1) as singletons, clusters as groups
+    # Separate noise points (-1) into individual singletons so every alert_id
+    # appears in exactly one output group, whether clustered or alone.
     result = []
     for label, alert_ids in clusters.items():
         if label == -1:

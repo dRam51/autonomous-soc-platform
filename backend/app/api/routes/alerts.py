@@ -21,22 +21,34 @@ from app.services.anomaly_detection import score_alert
 
 router = APIRouter()
 
-# In-memory stores for development - swap for PostgreSQL in production
+# In-memory stores for development: swap for PostgreSQL in production.
+# These dicts are per-process, so horizontal scaling requires a shared store (Redis + DB).
 _alerts: dict[str, AlertResponse] = {}
 _incidents: dict[str, IncidentReport] = {}
-_pipeline_events: dict[str, list[str]] = {}  # alert_id -> list of SSE event strings
-_duplicate_counts: dict[str, int] = {}        # original_alert_id -> duplicate count
+# SSE event queue: per-alert list of pre-formatted "data: {...}\n\n" strings.
+# The streaming endpoint drains this list as events arrive.
+_pipeline_events: dict[str, list[str]] = {}
+# Duplicate counter: tracks how many times each original alert has been seen again.
+_duplicate_counts: dict[str, int] = {}
 
+
+# === SSE Event Emitter ===
 
 def _emit_event(alert_id: str, event_type: str, data: dict) -> None:
-    """Append a pipeline progress event for SSE streaming."""
+    """Append a pipeline progress event for SSE streaming.
+
+    SSE (Server-Sent Events) format requires each event to be a "data: ...\n\n" string.
+    The double newline is the event boundary delimiter that the browser's EventSource API
+    uses to know where one event ends and the next begins. Malforming this boundary
+    causes the client to silently receive nothing.
+    """
     if alert_id not in _pipeline_events:
         _pipeline_events[alert_id] = []
     payload = json.dumps({"event": event_type, "data": data, "ts": datetime.utcnow().isoformat()})
     _pipeline_events[alert_id].append(f"data: {payload}\n\n")
 
 
-# ─── POST /alerts/ ────────────────────────────────────────────────────────────
+# === POST /alerts/ ===
 
 @router.post("/", response_model=AlertResponse, status_code=202)
 async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks):
@@ -48,30 +60,38 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks):
       2. ML anomaly scoring - is this statistically anomalous enough to investigate?
 
     If both pass, the multi-agent pipeline runs in the background.
-    Returns 202 immediately with the alert ID for status polling or SSE streaming.
+
+    Returns 202 (Accepted) immediately with the alert ID. 202 signals to the caller
+    that the request was received but processing has not finished yet. The client
+    should poll GET /alerts/{id} or subscribe to GET /alerts/{id}/stream for updates.
     """
     alert_id = str(uuid.uuid4())
     now = datetime.utcnow()
 
-    # ── Step 1: Semantic deduplication ────────────────────────────────────────
+    # === Step 1: Semantic Deduplication ===
+    # Embed the alert text and compare cosine similarity against recent alerts.
+    # If similarity >= dedup_similarity_threshold (default 0.92), this is a duplicate.
+    # We return the original alert so the client knows which one to watch.
     is_dup, original_id = await check_duplicate(alert_id, alert.title, alert.description)
     if is_dup and original_id:
         _duplicate_counts[original_id] = _duplicate_counts.get(original_id, 1) + 1
-        # Return the original alert with updated duplicate count
         if original_id in _alerts:
             original = _alerts[original_id]
             _emit_event(original_id, "duplicate_detected", {
                 "duplicate_count": _duplicate_counts[original_id]
             })
             return original
-        # Fall through if original not found (edge case)
 
-    # ── Step 2: ML anomaly pre-filter ─────────────────────────────────────────
+    # === Step 2: ML Anomaly Pre-Filter ===
+    # The Isolation Forest assigns a score (0-1, higher = more anomalous) and a
+    # binary prediction. Non-anomalous alerts are auto-closed without running the
+    # LLM pipeline, saving cost on routine, repetitive activity.
     anomaly_score, is_anomaly = await score_alert(alert)
     status = AlertStatus.NEW
 
     if not is_anomaly:
-        # Low anomaly score - auto-close without running the pipeline
+        # Below the anomaly threshold: mark as false positive and skip the pipeline.
+        # The anomaly_score is emitted in the event so analysts can audit the decision.
         status = AlertStatus.FALSE_POSITIVE
         alert_response = AlertResponse(
             **alert.model_dump(),
@@ -87,7 +107,10 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks):
         })
         return alert_response
 
-    # ── Normal flow: queue the full agent pipeline ─────────────────────────────
+    # === Normal Flow: Queue the Full Agent Pipeline ===
+    # BackgroundTasks runs _run_pipeline after the HTTP response is sent.
+    # This keeps the API responsive: the caller gets their 202 in milliseconds,
+    # not after the 30-60 second pipeline completes.
     alert_response = AlertResponse(
         **alert.model_dump(),
         id=alert_id,
@@ -102,14 +125,14 @@ async def create_alert(alert: AlertCreate, background_tasks: BackgroundTasks):
     return alert_response
 
 
-# ─── GET /alerts/ ─────────────────────────────────────────────────────────────
+# === GET /alerts/ ===
 
 @router.get("/", response_model=list[AlertResponse])
 async def list_alerts():
     return list(_alerts.values())
 
 
-# ─── GET /alerts/{id} ─────────────────────────────────────────────────────────
+# === GET /alerts/{id} ===
 
 @router.get("/{alert_id}", response_model=AlertResponse)
 async def get_alert(alert_id: str):
@@ -119,7 +142,7 @@ async def get_alert(alert_id: str):
     return alert
 
 
-# ─── GET /alerts/{id}/incident ────────────────────────────────────────────────
+# === GET /alerts/{id}/incident ===
 
 @router.get("/{alert_id}/incident", response_model=IncidentReport)
 async def get_alert_incident(alert_id: str):
@@ -132,15 +155,22 @@ async def get_alert_incident(alert_id: str):
     return incident
 
 
-# ─── GET /alerts/{id}/stream (SSE Streaming) ──────────────────────────────────
+# === GET /alerts/{id}/stream (SSE Streaming) ===
 
 @router.get("/{alert_id}/stream")
 async def stream_alert_pipeline(alert_id: str):
     """
     Stream pipeline progress events via Server-Sent Events (SSE).
 
-    The client connects once and receives real-time updates as each agent
-    completes its work, rather than polling the API repeatedly.
+    SSE keeps a single long-lived HTTP connection open from server to client.
+    The server pushes newline-delimited JSON events as they are emitted by the
+    pipeline. The client's browser-native EventSource API receives them without
+    polling. This is more efficient than WebSockets for one-directional push
+    and works transparently through most proxies and CDNs.
+
+    The generator polls _pipeline_events[alert_id] every 0.5s. In a production
+    system with Redis pub/sub, you would replace the polling loop with an
+    asyncio subscription to a Redis channel keyed by alert_id.
 
     Events emitted:
       pipeline_queued     - alert accepted, pipeline starting
@@ -150,10 +180,6 @@ async def stream_alert_pipeline(alert_id: str):
       auto_closed         - alert was below anomaly threshold
       pipeline_complete   - full incident report ready
       pipeline_error      - something failed
-
-    Usage:
-      const es = new EventSource('/api/v1/alerts/{id}/stream');
-      es.onmessage = (e) => console.log(JSON.parse(e.data));
     """
     if alert_id not in _alerts:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -164,12 +190,14 @@ async def stream_alert_pipeline(alert_id: str):
         elapsed = 0
 
         while elapsed < timeout_seconds:
+            # Drain any new events since our last check.
             events = _pipeline_events.get(alert_id, [])
             while sent_index < len(events):
                 yield events[sent_index]
                 sent_index += 1
 
-            # Check if pipeline is done
+            # Check if pipeline is done. If the alert status is terminal, send
+            # a stream_end event so the client knows to close its EventSource.
             alert = _alerts.get(alert_id)
             if alert and alert.status in (AlertStatus.CLOSED, AlertStatus.FALSE_POSITIVE):
                 yield f"data: {json.dumps({'event': 'stream_end', 'data': {}})}\n\n"
@@ -182,19 +210,26 @@ async def stream_alert_pipeline(alert_id: str):
         event_generator(),
         media_type="text/event-stream",
         headers={
+            # no-cache prevents intermediate proxies from buffering events.
             "Cache-Control": "no-cache",
+            # X-Accel-Buffering: no tells nginx not to buffer SSE responses,
+            # ensuring events reach the client immediately instead of in batches.
             "X-Accel-Buffering": "no",
         },
     )
 
 
-# ─── POST /alerts/{id}/approve (HITL) ─────────────────────────────────────────
+# === POST /alerts/{id}/approve (HITL) ===
 
 @router.post("/{alert_id}/approve", response_model=dict)
 async def approve_critical_alert(alert_id: str, background_tasks: BackgroundTasks):
     """
     Resume a CRITICAL alert pipeline that was paused for human-in-the-loop approval.
     Called by an analyst after reviewing the triage and threat intel findings.
+
+    The pipeline was frozen at the hitl_gate node by LangGraph's NodeInterrupt.
+    This endpoint injects hitl_approved=True into the checkpoint state and resumes
+    execution from exactly where it stopped. No work is repeated.
     """
     alert = _alerts.get(alert_id)
     if not alert:
@@ -210,10 +245,16 @@ async def approve_critical_alert(alert_id: str, background_tasks: BackgroundTask
     return {"status": "approved", "alert_id": alert_id, "message": "Pipeline resuming"}
 
 
-# ─── Background tasks ──────────────────────────────────────────────────────────
+# === Background Tasks ===
 
 async def _run_pipeline(alert_id: str, alert: AlertCreate, anomaly_score: float):
-    """Background task: run the full multi-agent SOC pipeline."""
+    """Background task: run the full multi-agent SOC pipeline for an alert.
+
+    Status transitions during a normal run:
+      NEW -> TRIAGING (set here before invoking the graph)
+      TRIAGING -> CLOSED (set here after the graph returns the incident report)
+    HITL-paused runs stay at TRIAGING until _resume_hitl_pipeline completes them.
+    """
     try:
         _alerts[alert_id].status = AlertStatus.TRIAGING
         _emit_event(alert_id, "agent_started", {"agent": "triage"})
@@ -228,13 +269,19 @@ async def _run_pipeline(alert_id: str, alert: AlertCreate, anomaly_score: float)
             "severity": incident.severity.value,
         })
     except Exception as e:
+        # Reset to NEW on failure so the alert can be retried manually.
         _alerts[alert_id].status = AlertStatus.NEW
         _emit_event(alert_id, "pipeline_error", {"error": str(e)})
         raise e
 
 
 async def _resume_hitl_pipeline(alert_id: str):
-    """Background task: resume a HITL-paused pipeline after analyst approval."""
+    """Background task: resume a HITL-paused pipeline after analyst approval.
+
+    Calls resume_pipeline() which re-invokes the LangGraph graph with hitl_approved=True
+    in the checkpoint state. LangGraph picks up from the hitl_gate node and continues
+    into investigation -> remediation -> reporting without repeating triage or threat_intel.
+    """
     try:
         incident = await resume_pipeline(alert_id)
         _incidents[alert_id] = incident

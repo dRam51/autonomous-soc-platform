@@ -15,6 +15,14 @@ Why Isolation Forest?
 This demonstrates the production pattern of hybrid ML + LLM systems,
 where classical ML handles the high-volume triage and LLMs handle
 the complex reasoning on a smaller filtered set.
+
+How Isolation Forest works conceptually:
+  Build many random decision trees. For each sample, count how many random
+  splits (tree depth) it takes to isolate it into its own leaf node. Anomalous
+  points are structurally different from the bulk and get isolated in fewer
+  splits (shorter path length = high anomaly score). Normal points blend into
+  the crowd and require more splits to isolate. Think of it as: the easier it is
+  to single out a data point, the more suspicious it is.
 """
 
 import numpy as np
@@ -26,17 +34,29 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Global model and scaler - trained incrementally as alerts arrive
+# Global model and scaler trained incrementally as alerts arrive.
+# The model starts in pass-through mode (all alerts treated as anomalies)
+# until MIN_TRAINING_SAMPLES are collected. This cold-start is intentional:
+# better to run the expensive LLM pipeline on early alerts than to reject
+# legitimate incidents before the model has learned what "normal" looks like.
 _model: IsolationForest | None = None
 _scaler: StandardScaler | None = None
 _training_buffer: list[list[float]] = []
-MIN_TRAINING_SAMPLES = 20  # Minimum alerts before model is trained
+MIN_TRAINING_SAMPLES = 20
 
+
+# === Feature Extraction ===
 
 def _extract_features(alert) -> list[float]:
     """
     Extract numerical features from an alert for anomaly scoring.
     Features are designed to capture statistical rareness, not semantic meaning.
+
+    Isolation Forest operates on numbers, not text. We convert alert metadata
+    into a 10-dimensional vector that captures structural properties. The model
+    learns what "typical" alerts look like in this feature space and flags
+    structural outliers. Note: this does NOT capture semantic meaning of the
+    title/description - that is the LLM's job.
 
     Feature vector (10 dimensions):
     0: Source IP entropy (0=private/loopback, 1=public)
@@ -68,6 +88,9 @@ def _extract_features(alert) -> list[float]:
         return 0.5
 
     def source_hash(source: str) -> float:
+        # Map the source system name to a stable float in [0,1]. This lets the
+        # model learn that alerts from "EDR" have different normal patterns than
+        # alerts from "Firewall" without needing one-hot encoding.
         h = int(hashlib.md5(source.lower().encode()).hexdigest(), 16)
         return (h % 100) / 100.0
 
@@ -85,8 +108,20 @@ def _extract_features(alert) -> list[float]:
     ]
 
 
+# === Model Training ===
+
 def _train_model() -> None:
-    """Train or retrain the Isolation Forest on buffered samples."""
+    """Train or retrain the Isolation Forest on buffered samples.
+
+    StandardScaler is applied before fitting because Isolation Forest uses random
+    splits on feature value ranges. Without scaling, features with large ranges
+    (e.g., description_length 0-500) would dominate over binary features (0/1),
+    skewing which splits the trees make.
+
+    contamination is the expected fraction of anomalies in the data. Setting it
+    to anomaly_threshold (default 0.15) tells the model that ~15% of alerts are
+    expected to be anomalous, calibrating the decision boundary accordingly.
+    """
     global _model, _scaler
 
     if len(_training_buffer) < MIN_TRAINING_SAMPLES:
@@ -98,13 +133,15 @@ def _train_model() -> None:
 
     _model = IsolationForest(
         contamination=settings.anomaly_threshold,
-        n_estimators=100,
-        random_state=42,
-        n_jobs=-1,
+        n_estimators=100,       # More trees = more stable scores, diminishing returns above 200
+        random_state=42,        # Fixed seed for reproducibility across retrains
+        n_jobs=-1,              # Parallelize tree building across all CPU cores
     )
     _model.fit(X_scaled)
     logger.info(f"[AnomalyDetection] Model trained on {len(_training_buffer)} samples")
 
+
+# === Alert Scoring ===
 
 async def score_alert(alert) -> tuple[float, bool]:
     """
@@ -121,26 +158,33 @@ async def score_alert(alert) -> tuple[float, bool]:
         return 1.0, True
 
     features = _extract_features(alert)
+    # Add this alert's features to the training buffer. The model periodically
+    # retrains itself as it sees more data, improving its baseline over time.
     _training_buffer.append(features)
 
-    # Retrain every 50 new alerts
+    # Retrain every 50 new alerts. More frequent retraining keeps the baseline
+    # current but is computationally expensive; 50 is a reasonable trade-off.
     if len(_training_buffer) % 50 == 0:
         _train_model()
 
     if _model is None or _scaler is None:
+        # Pass-through before model is ready: do not filter anything.
         logger.debug("[AnomalyDetection] Model not yet trained, passing alert through")
         return 1.0, True
 
     X = np.array([features])
     X_scaled = _scaler.transform(X)
 
-    # Isolation Forest score: negative values = more anomalous
+    # score_samples returns the anomaly score as a negative value where more
+    # negative = more anomalous (Isolation Forest's internal convention).
+    # We invert and shift to produce an intuitive 0-1 score where 1 = most anomalous.
     raw_score = _model.score_samples(X_scaled)[0]
-    # Normalize to 0-1 where 1 = most anomalous
     normalized = float(1.0 - (raw_score + 0.5))
     normalized = max(0.0, min(1.0, normalized))
 
-    prediction = _model.predict(X_scaled)[0]  # -1 = anomaly, 1 = normal
+    # predict() returns -1 for anomaly, 1 for normal. We use this binary label
+    # as the gate: -1 means "send to LLM pipeline," 1 means "auto-close."
+    prediction = _model.predict(X_scaled)[0]
     is_anomaly = prediction == -1
 
     logger.info(

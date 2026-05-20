@@ -65,10 +65,10 @@ async def embed_alert(alert_text: str) -> list[float] | None:
     will have very high cosine similarity even though the words differ.
     """
     try:
-        from langchain_community.embeddings import VoyageEmbeddings
+        from langchain_voyageai import VoyageAIEmbeddings
         from app.config import settings
-        embedder = VoyageEmbeddings(
-            voyage_api_key=settings.anthropic_api_key,
+        embedder = VoyageAIEmbeddings(
+            voyage_api_key=settings.voyage_api_key,
             model="voyage-3"
         )
         return embedder.embed_query(alert_text)

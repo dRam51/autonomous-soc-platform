@@ -167,31 +167,30 @@ def build_soc_graph() -> StateGraph:
 
     graph = StateGraph(SOCState)
 
-    # Register every node. The string name is what conditional_edges references.
-    graph.add_node("triage", run_triage)
+    # Node names must not clash with SOCState key names (LangGraph constraint).
+    # "triage", "investigation", and "remediation" are state keys, so we suffix with _node.
+    graph.add_node("triage_node", run_triage)
     graph.add_node("parallel_enrichment", run_parallel_enrichment)
     graph.add_node("hitl_gate", hitl_approval_gate)
-    graph.add_node("investigation", run_investigation)
-    graph.add_node("remediation", run_remediation)
+    graph.add_node("investigation_node", run_investigation)
+    graph.add_node("remediation_node", run_remediation)
     graph.add_node("reporting", run_reporting)
 
-    # Define execution order. add_edge means "always go here next."
-    # add_conditional_edges means "route based on a function's return value."
-    graph.set_entry_point("triage")
-    graph.add_edge("triage", "parallel_enrichment")
+    graph.set_entry_point("triage_node")
+    graph.add_edge("triage_node", "parallel_enrichment")
     graph.add_edge("parallel_enrichment", "hitl_gate")
     graph.add_conditional_edges(
         "hitl_gate",
         should_investigate,
-        {"investigate": "investigation", "remediate": "remediation"},
+        {"investigate": "investigation_node", "remediate": "remediation_node"},
     )
-    graph.add_edge("investigation", "remediation")
-    graph.add_edge("remediation", "reporting")
+    graph.add_edge("investigation_node", "remediation_node")
+    graph.add_edge("remediation_node", "reporting")
     graph.add_edge("reporting", END)
 
-    # interrupt_before=["hitl_gate"] tells LangGraph to pause before entering that
-    # node on the first pass. NodeInterrupt inside the node handles subsequent pauses.
-    return graph.compile(checkpointer=checkpointer, interrupt_before=["hitl_gate"])
+    # interrupt_before must NOT list hitl_gate — the node itself raises NodeInterrupt
+    # conditionally for CRITICAL alerts. Listing it here pauses every pipeline unconditionally.
+    return graph.compile(checkpointer=checkpointer)
 
 
 # Module-level singleton so the graph is compiled once at startup, not per-request.

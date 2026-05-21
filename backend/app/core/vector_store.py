@@ -17,9 +17,8 @@ Pinecone's index structure makes retrieval sub-millisecond.
 """
 
 from pinecone import Pinecone
-from langchain_anthropic import ChatAnthropic
 from langchain_pinecone import PineconeVectorStore
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_voyageai import VoyageAIEmbeddings
 from app.config import settings
 import logging
 
@@ -56,8 +55,7 @@ def get_vector_store() -> PineconeVectorStore:
         # It encodes text into a 1024-dimensional vector space where semantically similar
         # texts are geometrically close. The voyage_api_key here is the Anthropic key
         # because Voyage is an Anthropic-affiliated embedding service.
-        from langchain_community.embeddings import VoyageEmbeddings
-        embeddings = VoyageEmbeddings(voyage_api_key=settings.anthropic_api_key, model="voyage-3")
+        embeddings = VoyageAIEmbeddings(voyage_api_key=settings.voyage_api_key, model="voyage-3")
         _vector_store = PineconeVectorStore(index=index, embedding=embeddings)
     return _vector_store
 

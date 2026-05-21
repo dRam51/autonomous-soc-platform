@@ -164,7 +164,7 @@ for attack pattern context. Then submit your complete investigation findings."""
     for iteration in range(max_iterations):
         response = await client.messages.create(
             model="claude-opus-4-5",
-            max_tokens=4096,
+            max_tokens=16000,  # must exceed budget_tokens (8000) + expected output
             system=[
                 {
                     "type": "text",

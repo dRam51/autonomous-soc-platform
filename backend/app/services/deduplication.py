@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Structure: list of {"alert_id": str, "embedding": list[float], "timestamp": datetime, "title": str}
 # Redis is better for production because it survives worker restarts and is shared
 # across multiple API server instances, whereas this in-memory store is per-process.
-_recent_embeddings: list[dict] = {}
+_recent_embeddings: list[dict] = []
 DEDUP_WINDOW_MINUTES = 30
 
 

@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Local-only docs
+ONBOARDING.md
+
 # Python
 __pycache__/
 *.py[cod]

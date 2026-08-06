@@ -50,3 +50,8 @@ data/raw/
 
 # LangSmith / secrets
 langsmith_traces/
+
+# Credentials files (never commit these)
+api-keys
+api-keys.*
+*credentials*
